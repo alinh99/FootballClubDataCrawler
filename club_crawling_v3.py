@@ -288,8 +288,9 @@ async def fetch_club_info(client: httpx.AsyncClient, club_id: str, age: int, pla
                     wgs_id = data.get("WgsClubId")
                     if wgs_id:
                         try:
+                            contact_base = os.getenv("API_CLUB_CONTACT_URL", "https://hcdeapimngt1.azure-api.net/external/v1/orgs")
                             contact_resp = await client.get(
-                                f"https://hcdeapimngt1.azure-api.net/external/v1/orgs/{wgs_id}/clubcontact",
+                                f"{contact_base}/{wgs_id}/clubcontact",
                                 headers={"Ocp-Apim-Subscription-Key": os.getenv("KEY_CLUB_CONTACT_INFO"), "User-Agent": f"scraper-bot/{random.randint(1,1000)}"},
                                 timeout=300.0
                             )

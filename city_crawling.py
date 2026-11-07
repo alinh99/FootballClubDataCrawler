@@ -14,11 +14,6 @@ city_result = {}  # Initialize an empty dictionary for city results
 
 soup = BeautifulSoup(get_data("https://www.gov.uk/government/publications/list-of-cities/list-of-cities-html"), "html.parser")
 
-# Open the CSV file once before the loop starts
-with open("england_city.csv", "w") as file:
-    file.write("name\n")  # Write header
-
-
 city_names = list(soup.find("h4", {"id": "england"}).find_next().descendants)
 
 cities = []
@@ -34,4 +29,5 @@ for city_name in city_names:
 
 df = pd.DataFrame(cities)
 df.drop_duplicates(inplace=True)
-df.to_csv(f"{OUTPUT_FOLDER_NAME}/england_city.csv", mode='a', header=True, index=False)
+df.to_csv(f"{OUTPUT_FOLDER_NAME}/england_city.csv", index=False)
+print(f"Saved {len(df)} cities to {OUTPUT_FOLDER_NAME}/england_city.csv")

@@ -1,2 +1,6 @@
 pandas
 selenium
+webdriver-manager
+fake-useragent
+python-dotenv
+tqdm

@@ -1,0 +1,6 @@
+pandas
+curl_cffi
+tqdm
+fake-useragent
+python-dotenv
+filelock

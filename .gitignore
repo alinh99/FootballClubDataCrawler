@@ -3,3 +3,5 @@
 *.zip
 *.env
 *.pkl
+__pycache__
+*.pyc

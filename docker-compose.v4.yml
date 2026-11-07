@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  crawler-v4:
+    build:
+      context: .
+      dockerfile: Dockerfile.v4
+    container_name: football-club-crawler-v4
+    environment:
+      # API Keys (required for production)
+      - API_CLUB_RECOMMENDATION_URL=https://hcdeapimngt1.azure-api.net/discoverfootball-subky/v1/api/clubandcasualrecommendation
+      - API_CLUB_INFO_URL=https://hcdeapimngt1.azure-api.net/discoverfootball-subky/v1/api/club
+      - API_CLUB_CONTACT_URL=https://hcdeapimngt1.azure-api.net/external/v1/orgs
+      - KEY_CLUB_INFO_AND_RECOMMENDATION_INFO=${KEY_CLUB_INFO_AND_RECOMMENDATION_INFO}
+      - KEY_CLUB_CONTACT_INFO=${KEY_CLUB_CONTACT_INFO}
+      # Crawler Config
+      - MAX_PROCESSES=5
+      - MAX_CONCURRENT_REQUESTS=50
+      - TOTAL_RETRIES=1000000000
+      - BATCH_SAVE_SIZE=200
+      - RATE_LIMIT_SLEEP=60
+    volumes:
+      # Persist output, cache, and logs
+      - ./output:/app/output
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    # Run with default dry-run for testing
+    # Override command for production:
+    # command: ["--max-combos", "10"]
+    command: ["--dry-run", "--max-combos", "3"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from v4 import config, models, storage, api, crawler, eta, main, types; print('OK')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Optional: Run city_crawling.py first to get city list
+  city-crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile.v4
+    container_name: football-city-crawler
+    command: ["python", "city_crawling.py"]
+    volumes:
+      - ./output:/app/output
+    restart: "no"
