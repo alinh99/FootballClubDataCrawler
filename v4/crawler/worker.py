@@ -11,16 +11,15 @@ from typing import Any, Dict, List, Set
 from multiprocessing.managers import ValueProxy
 from multiprocessing.synchronize import Lock as LockProxy
 
-from v4.config import MAX_CONCURRENT_REQUESTS, TOTAL_RETRIES
+from v4.config import MAX_CONCURRENT_REQUESTS, MAX_CONCURRENT_LIMIT, TOTAL_RETRIES
 from v4.models import AdaptiveLimiter
 from v4.api import fetch_recommendation_pages, fetch_club_info, extract_full_club_data_from_recommendation
 from v4.storage import (
-    load_existing_output_info, atomic_pickle_dump, async_append_csv_rows_safe,
+    atomic_pickle_dump, async_append_csv_rows_safe,
     async_append_basic_csv_rows, safe_load_pickle, close_all_csv_writers
 )
 from v4.types import (
-    CityName, ClubId, ComboKey, ClubCache, ExistingClubNames,
-    ClubRow, BasicClubRow, StatsDict, WorkerArgs, ProcessedCombos
+    CityName, ClubRow, BasicClubRow, StatsDict, WorkerArgs, ProcessedCombos
 )
 from v4.crawler.logging import log_error_with_context
 
@@ -29,9 +28,6 @@ logger = logging.getLogger(__name__)
 
 async def process_combo_async(
     city: CityName,
-    existing_club_names: ExistingClubNames,
-    club_cache: ClubCache,
-    processed_clubs_local: Dict[ComboKey, Set[ClubId]],
     stats: StatsDict,
     dry_run: bool = False
 ) -> List[ClubRow]:
@@ -41,7 +37,7 @@ async def process_combo_async(
     Phase 2: Fetch detailed info and write to detail CSV (for any missing fields).
     """
     combo_key = f"{city}__0"
-    limiter = AdaptiveLimiter(MAX_CONCURRENT_REQUESTS, min_concurrent=5, max_concurrent=MAX_CONCURRENT_REQUESTS)
+    limiter = AdaptiveLimiter(MAX_CONCURRENT_REQUESTS, min_concurrent=5, max_concurrent=MAX_CONCURRENT_LIMIT)
     api_general_info_data = await fetch_recommendation_pages(city, dry_run)
 
     # Extract ALL fields from recommendation API response
@@ -57,16 +53,6 @@ async def process_combo_async(
         club_id = club_data.get("ClubId", "")
         if not club_id:
             continue
-
-        # Skip if already in cache for this city
-        if club_id in club_cache:
-            cached_city = club_cache[club_id].get("City") if isinstance(club_cache[club_id], dict) else None
-            if cached_city == city:
-                stats["skipped_cache"] += 1
-                logger.warning(
-                    f"Club {club_id} - City: {city} already exists in cache. Skipping basic write."
-                )
-                continue
 
         # Build basic row with ALL fields from recommendation API
         basic_row: BasicClubRow = {
@@ -94,13 +80,23 @@ async def process_combo_async(
 
     from curl_cffi import AsyncSession
     async with AsyncSession(impersonate="chrome120", timeout=300.0) as client:
-        tasks = [
-            fetch_club_info(
-                client, club_id, 0, 4, city, limiter,
-                existing_club_names, combo_key, club_cache, processed_clubs_local, stats, dry_run
+        tasks = []
+        for club_id in club_ids_to_fetch_detail:
+            # Find the club data from recommendation to extract additional fields
+            club_data = next((c for c in clubs_data if c.get("ClubId") == club_id), {})
+            tasks.append(
+                fetch_club_info(
+                    client, club_id, 0, 4, city, limiter, stats, dry_run,
+                    latitude=club_data.get("Latitude", 51.5074),
+                    longitude=club_data.get("Longitude", -0.1278),
+                    week_days=club_data.get("WeekDays", "1,2,3,4,5,6,7"),
+                    disability_option=club_data.get("Disabilityoption", 3),
+                    disability_type=club_data.get("DisabilityType", []),
+                    school_year=club_data.get("SchoolYear", ""),
+                    football_type=club_data.get("FootballType", "U10"),
+                    search_id=club_data.get("SearchId", None)
+                )
             )
-            for club_id in club_ids_to_fetch_detail
-        ]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
     for r in raw_results:
         if isinstance(r, dict):
@@ -125,14 +121,11 @@ def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
     start = time.time()
     logger.info(f"Process start for city {city}, combos={len(pending_combos)}, dry_run={dry_run}, limit={limit}")
 
-    existing_club_names, combos_from_csv = load_existing_output_info()
-    club_cache = safe_load_pickle("storage/club_cache.pkl", {}) or {}
     processed_combos_global = safe_load_pickle("storage/processed_combos.pkl", set()) or set()
-    processed_clubs_local: Dict[ComboKey, Set[ClubId]] = {}
     processed_combos_buffer: ProcessedCombos = set()
 
     stats: StatsDict = {"success": 0, "failed": 0, "http_errors": 0, "other_errors": 0,
-             "rate_limited": 0, "skipped_name": 0, "skipped_cache": 0, "no_name": 0}
+             "rate_limited": 0, "skipped_cache": 0, "no_name": 0}
 
     total = len(pending_combos)
     pbar = tqdm(total=total, desc=f"City: {city}", ncols=120, position=1, leave=False)
@@ -166,9 +159,6 @@ def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
                 try:
                     rows = loop.run_until_complete(process_combo_async(
                         city,
-                        existing_club_names,
-                        club_cache,
-                        processed_clubs_local,
                         stats,
                         dry_run=dry_run
                     ))
@@ -223,7 +213,6 @@ def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
             processed_combos_global.update(processed_combos_buffer)
         try:
             atomic_pickle_dump(processed_combos_global, "storage/processed_combos.pkl")
-            atomic_pickle_dump(club_cache, "storage/club_cache.pkl")
         except Exception as e:
             log_error_with_context(
                 logger, f"Final dump failed: {e}",

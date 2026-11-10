@@ -4,7 +4,7 @@ Club Info API for v4 crawler: fetch detailed club information.
 import asyncio
 import random
 import logging
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from curl_cffi import AsyncSession
 from fake_useragent import UserAgent
@@ -16,8 +16,7 @@ from v4.config import (
 )
 from v4.models import AdaptiveLimiter
 from v4.types import (
-    CityName, ClubId, ComboKey, ClubCache, ExistingClubNames,
-    ClubRow, StatsDict, ClubInfoPayload
+    CityName, ClubId, ClubRow, StatsDict, ClubInfoPayload
 )
 from v4.utils.logging import log_error_with_context
 
@@ -31,28 +30,60 @@ async def fetch_club_info(
     play_with: int,
     city: CityName,
     limiter: AdaptiveLimiter,
-    existing_club_names: ExistingClubNames,
-    combo_key: ComboKey,
-    club_cache: ClubCache,
-    processed_clubs_local: Dict[ComboKey, Set[ClubId]],
     stats: StatsDict,
-    dry_run: bool = False
+    dry_run: bool = False,
+    latitude: float = 51.5074,
+    longitude: float = -0.1278,
+    week_days: str = "1,2,3,4,5,6,7",
+    disability_option: int = 3,
+    disability_type: Optional[List[Dict]] = None,
+    school_year: str = "",
+    football_type: str = "U10",
+    search_id: Optional[str] = None
 ) -> Optional[ClubRow]:
     """
     Fetch detailed club information from the club info API.
+
+    Additional parameters from recommendation data:
+    - latitude: Latitude for location-based search
+    - longitude: Longitude for location-based search
+    - week_days: Comma-separated week days (e.g., "1,2,3,4,5,6,7")
+    - disability_option: Disability option filter
+    - disability_type: List of disability types
+    - school_year: School year filter
+    - football_type: Football type string (e.g., "U10")
+    - search_id: Unique search identifier
     """
+    import uuid
+    if disability_type is None:
+        disability_type = []
+    if search_id is None:
+        search_id = str(uuid.uuid4())
+
     payload: ClubInfoPayload = {
         "ClubId": club_id,
         "Age": age,
         "PlayWith": play_with,
+        "DisabilityType": disability_type,
+        "Disabilityoption": disability_option,
+        "FootballType": football_type,
+        "WeekDays": week_days,
+        "Latitude": latitude,
+        "Longitude": longitude,
+        "SchoolYear": school_year,
     }
 
     headers_base = {
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
         "User-Agent": UserAgent().random,
-        "Ocp-Apim-Subscription-Key": KEY_CLUB_INFO_AND_RECOMMENDATION_INFO
+        "Ocp-Apim-Subscription-Key": KEY_CLUB_INFO_AND_RECOMMENDATION_INFO,
+        "Host": "hcdeapimngt1.azure-api.net",
+        "Origin": "https://find.englandfootball.com",
+        "Referer": "https://find.englandfootball.com/",
+        "Sec-Fetch-Site": "same-site",
     }
 
     async with limiter.sem:
@@ -68,13 +99,14 @@ async def fetch_club_info(
                         "ClubCounty": "DryCounty",
                         "TeamsInfo": {"FootballType": ["5-a-side"], "Gender": [], "DisabilityType": []},
                         "TeamsCount": random.randint(1, 5),
-                        "WgsClubId": None
+                        "WgsClubId": None,
+                        "ClubId": club_id,
                     }
                     contact_data = {}
                 else:
                     headers = {
                         **headers_base,
-                        "User-Agent": f"scraper-bot/{random.randint(1, 1000)}",
+                        "User-Agent": f"sb/{random.randint(1, 1000)}",
                         "Ocp-Apim-Subscription-Key": KEY_CLUB_INFO_AND_RECOMMENDATION_INFO
                     }
                     resp = await client.post(API_CLUB_INFO_URL, json=payload, headers=headers, timeout=300.0)
@@ -108,10 +140,6 @@ async def fetch_club_info(
                     await limiter.record_success()
 
                     club_name = (data.get("ClubName", "") or "").strip()
-                    if city in existing_club_names and club_name in existing_club_names[city]:
-                        stats["skipped_name"] += 1
-                        logger.warning(f"[SKIP] Club '{club_name}' already exists in city '{city}'. Skipping.")
-                        return None
                     contact_data = {}
                     wgs_id = data.get("WgsClubId")
                     if wgs_id:
@@ -139,17 +167,13 @@ async def fetch_club_info(
                     stats["no_name"] += 1
                     return None
 
-                if city in existing_club_names and club_name in existing_club_names[city]:
-                    stats["skipped_name"] += 1
-                    logger.warning(f"[SKIP] Club '{club_name}' already exists in city '{city}'. Skipping.")
-                    return None
-
                 teams_info = data.get("TeamsInfo", {}) or {}
                 football_types_list = []
                 football_types_list.extend(teams_info.get("FootballType", []) or [])
                 football_types_list.extend(teams_info.get("Gender", []) or [])
                 football_types_list.extend(teams_info.get("DisabilityType", []) or [])
 
+                # Build row with all recommendation fields included
                 row: ClubRow = {
                     "City": city,
                     "PlayWith": play_with,
@@ -164,14 +188,23 @@ async def fetch_club_info(
                     "Football Types": ", ".join(filter(None, football_types_list)),
                     "Team Numbers": data.get("TeamsCount", 0) or 0,
                     "Contact Name": contact_data.get("individualName", "") or "",
-                    "Contact Phone": contact_data.get("phone", "") or "",
-                    "Contact Email": contact_data.get("email", "") or "",
-                    "Contact Website": contact_data.get("website", "") or ""
+                    "Contact Phone": contact_data.get("phone", "") or  data.get("TelephoneNumber", "") or "",
+                    "Contact Email": contact_data.get("email", "") or data.get("EmailAddress", "") or "",
+                    "Contact Website": contact_data.get("website", "") or data.get("Website", "") or "",
+                    # Recommendation fields from payload
+                    "WeekDays": week_days,
+                    "Latitude": latitude,
+                    "Longitude": longitude,
+                    "SchoolYear": school_year,
+                    "FootballType": football_type,
+                    "DisabilityOption": disability_option,
+                    "SearchId": search_id,
+                    # Additional fields from API response
+                    "WgsClubId": data.get("WgsClubId", "") or "",
+                    "ClubId": data.get("ClubId", club_id) or club_id,
+                    "GroundName": data.get("GroundName", "") or "",
                 }
 
-                existing_club_names.setdefault(city, set()).add(club_name)
-                club_cache[club_id] = row
-                processed_clubs_local.setdefault(combo_key, set()).add(club_id)
                 stats["success"] += 1
                 return row
 

@@ -2,7 +2,6 @@
 Main crawler runner for v4: orchestrates multiprocessing + asyncio.
 """
 import time
-import random
 import logging
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -12,7 +11,7 @@ from multiprocessing.synchronize import Lock as LockProxy
 from tqdm import tqdm
 from typing import Any, Dict, List
 
-from v4.config import MAX_PROCESSES, TOTAL_RETRIES
+from v4.config import MAX_PROCESSES, MAX_CONCURRENT_REQUESTS, CSV_FILE
 from v4.storage import (
     load_existing_output_info, safe_load_pickle, save_summary_csv
 )
@@ -76,7 +75,7 @@ def run_crawler(
     print(f"Total cities to process: {len(city_args)}")
     print(f"Total pending combos: {total_pending_combos:,}")
     print(f"Max processes: {MAX_PROCESSES}")
-    print(f"Concurrent requests/process: {MAX_PROCESSES}")
+    print(f"Concurrent requests/process: {MAX_CONCURRENT_REQUESTS}")
     print(f"Dry run: {dry_run}")
     if limit > 0:
         print(f"Club limit: {limit}")
@@ -126,29 +125,28 @@ def run_crawler(
 
         for fut in as_completed(future_to_city):
             city = future_to_city[fut]
-            for current_retry in range(TOTAL_RETRIES):
-                try:
-                    res = fut.result()
-                    logger.info(f"City finished: {res['city']} elapsed {res['elapsed']:.1f}s")
+            try:
+                res = fut.result()
+                logger.info(f"City finished: {res['city']} elapsed {res['elapsed']:.1f}s")
 
-                    stats = res.get("stats", {})
-                    overall_stats["total_fetched"] += stats.get("success", 0)
-                    overall_stats["saved"] += stats.get("success", 0)
-                    overall_stats["skipped_name"] += stats.get("skipped_name", 0)
-                    overall_stats["skipped_other"] += stats.get("skipped_cache", 0) + stats.get("no_name", 0) + stats.get("other_errors", 0)
+                stats = res.get("stats", {})
+                overall_stats["total_fetched"] += stats.get("success", 0)
+                overall_stats["saved"] += stats.get("success", 0)
+                overall_stats["skipped_name"] += stats.get("skipped_name", 0)
+                overall_stats["skipped_other"] += stats.get("skipped_cache", 0) + stats.get("no_name", 0) + stats.get("other_errors", 0)
 
-                    if stats.get("failed", 0) > 0:
-                        # Only mark as failed if there are REAL errors (not just empty combos)
-                        real_errors = stats.get("http_errors", 0) + stats.get("other_errors", 0)
-                        if real_errors > 0:
-                            failed_cities.append(res['city'])
-                    break
-                except Exception as e:
-                    log_error_with_context(
-                        logger, f"City future error: {e}. Retry: {current_retry+1}",
-                        city=city, attempt=current_retry+1, error=e, level="error"
-                    )
-                    time.sleep(min(0.5 * (2 ** current_retry) + random.random(), 10.0))
+                if stats.get("failed", 0) > 0:
+                    # Only mark as failed if there are REAL errors (not just empty combos)
+                    real_errors = stats.get("http_errors", 0) + stats.get("other_errors", 0)
+                    if real_errors > 0:
+                        failed_cities.append(res['city'])
+            except Exception as e:
+                log_error_with_context(
+                    logger, f"City worker process failed: {e}",
+                    city=city, error=e, level="error"
+                )
+                failed_cities.append(city)
+                # Continue to next city - don't hang on retries
 
             # Update overall progress bar with shared counter
             while True:
@@ -188,6 +186,27 @@ def run_crawler(
 
     logger.info(f"✅ Crawl completed successfully in {hours:02d}:{minutes:02d}:{seconds:02d}")
     logger.info(f"🏁 End time: {end_dt}")
+
+    # ===== FINAL DEDUPLICATION: Drop duplicate rows ignoring specific columns =====
+    logger.info("Starting final deduplication pass...")
+    try:
+        import pandas as pd
+        df = pd.read_csv(CSV_FILE)
+        original_count = len(df)
+        # Columns to ignore when checking for duplicates
+        ignore_cols = {"City", "PlayWith", "Age", "Latitude", "Longitude"}
+        # Use all columns except ignored ones as the subset for deduplication
+        subset_cols = [c for c in df.columns if c not in ignore_cols]
+        df_deduped = df.drop_duplicates(subset=subset_cols)
+        deduped_count = len(df_deduped)
+        removed_count = original_count - deduped_count
+        if removed_count > 0:
+            df_deduped.to_csv(CSV_FILE, index=False)
+            logger.info(f"Final deduplication: removed {removed_count} duplicate rows (ignoring {ignore_cols}) ({original_count} → {deduped_count})")
+        else:
+            logger.info(f"Final deduplication: no duplicates found ({original_count} rows)")
+    except Exception as e:
+        logger.warning(f"Final deduplication failed: {e}")
 
     # Save summary CSV
     save_summary_csv(cities, overall_stats, failed_cities, start_dt, elapsed)

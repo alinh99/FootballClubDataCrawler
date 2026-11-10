@@ -132,7 +132,7 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False) -> L
         "Disabilityoption": 3,
         "DisabilityType": [],
         "SelectedDisabilityType": "",
-        "Distance": 10,
+        "Distance": 40,
         "OptforCurrentLocation": "No",
         "Latitude": latitude,
         "Longitude": longitude,
