@@ -13,7 +13,8 @@ from typing import Any, Dict, List
 
 from v4.config import MAX_PROCESSES, MAX_CONCURRENT_REQUESTS, CSV_FILE
 from v4.storage import (
-    load_existing_output_info, safe_load_pickle, save_summary_csv
+    load_existing_output_info, safe_load_pickle, save_summary_csv,
+    load_checkpoint_json, save_checkpoint_json, log_checkpoint_status
 )
 from v4.eta import ETACalculator
 from v4.types import CityName, StatsDict, WorkerArgs
@@ -32,22 +33,39 @@ def run_crawler(
 ) -> None:
     """
     Run the crawler for multiple cities using multiprocessing + asyncio.
+    Uses JSON checkpoint for human-readable resume capability.
     """
-    # Load cities và combo đã crawl
+    # Load existing data from CSV + JSON checkpoint (priority: JSON > pickle > CSV)
     _, combos_from_csv = load_existing_output_info()
     processed_from_pickle = safe_load_pickle("storage/processed_combos.pkl", set()) or set()
     existing_combo_set = set().union(combos_from_csv, processed_from_pickle)
 
+    # Load JSON checkpoint for resume
+    (json_processed_combos, json_club_cache, json_stats,
+     json_current_city, json_current_combo, json_pending_cities) = load_checkpoint_json()
+
+    # Merge JSON checkpoint with existing data
+    if json_processed_combos:
+        existing_combo_set.update(json_processed_combos)
+        logger.info(f"Loaded {len(json_processed_combos)} combos from JSON checkpoint")
+
+    if json_pending_cities:
+        logger.info(f"JSON checkpoint has {len(json_pending_cities)} pending cities")
+
     start_time = time.time()
     start_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logger.info(f"🚀 Crawl started at {start_dt}")
+    log_checkpoint_status(json_processed_combos, json_club_cache, json_stats, json_current_city, json_current_combo)
 
     # Build per-city pending combos with limits
     city_args: List[WorkerArgs] = []
     total_pending_combos = 0
     combos_added = 0
 
-    for city in cities:
+    # Use pending cities from JSON checkpoint if available, otherwise all cities
+    cities_to_process = json_pending_cities if json_pending_cities else cities
+
+    for city in cities_to_process:
         pending = build_pending_combos_for_city(city, existing_combo_set)
         if pending:
             # Apply max_combos limit
@@ -161,6 +179,9 @@ def run_crawler(
                     overall_pbar.set_postfix_str(
                         f"Rate: {eta_calc.get_rate_str()} | ETA: {eta_calc.get_eta_str()} | {eta_calc.get_progress_str()}"
                     )
+                    # Log progress to file (every 10 combos or significant progress)
+                    if current % 10 == 0 or current == total_pending_combos:
+                        logger.info(f"PROGRESS: {eta_calc.get_progress_str()} | Rate: {eta_calc.get_rate_str()} | ETA: {eta_calc.get_eta_str()}")
                 else:
                     break
 
@@ -187,22 +208,20 @@ def run_crawler(
     logger.info(f"✅ Crawl completed successfully in {hours:02d}:{minutes:02d}:{seconds:02d}")
     logger.info(f"🏁 End time: {end_dt}")
 
-    # ===== FINAL DEDUPLICATION: Drop duplicate rows ignoring specific columns =====
+    # ===== FINAL DEDUPLICATION: Drop duplicate rows keeping City association =====
     logger.info("Starting final deduplication pass...")
     try:
         import pandas as pd
         df = pd.read_csv(CSV_FILE)
         original_count = len(df)
-        # Columns to ignore when checking for duplicates
-        ignore_cols = {"City", "PlayWith", "Age", "Latitude", "Longitude"}
-        # Use all columns except ignored ones as the subset for deduplication
+        ignore_cols = {"PlayWith", "Age", "Latitude", "Longitude", "SearchId"}
         subset_cols = [c for c in df.columns if c not in ignore_cols]
         df_deduped = df.drop_duplicates(subset=subset_cols)
         deduped_count = len(df_deduped)
         removed_count = original_count - deduped_count
         if removed_count > 0:
             df_deduped.to_csv(CSV_FILE, index=False)
-            logger.info(f"Final deduplication: removed {removed_count} duplicate rows (ignoring {ignore_cols}) ({original_count} → {deduped_count})")
+            logger.info(f"Final deduplication: removed {removed_count} duplicate rows (ignoring {ignore_cols}, keeping City) ({original_count} → {deduped_count})")
         else:
             logger.info(f"Final deduplication: no duplicates found ({original_count} rows)")
     except Exception as e:
@@ -210,6 +229,29 @@ def run_crawler(
 
     # Save summary CSV
     save_summary_csv(cities, overall_stats, failed_cities, start_dt, elapsed)
+
+    # ===== SAVE JSON CHECKPOINT FOR RESUME =====
+    try:
+        # Re-load current state from pickle (updated by workers)
+        final_processed = safe_load_pickle("storage/processed_combos.pkl", set()) or set()
+        final_cache = safe_load_pickle("storage/club_cache.pkl", {}) or {}
+
+        # Determine pending cities for next run
+        _, combos_from_csv = load_existing_output_info()
+        all_done_combos = set().union(combos_from_csv, final_processed)
+        pending_cities = [c for c in cities if build_pending_combos_for_city(c, all_done_combos)]
+
+        save_checkpoint_json(
+            processed_combos=final_processed,
+            club_cache=final_cache,
+            stats=overall_stats,
+            current_city=None,
+            current_combo=None,
+            pending_cities=pending_cities
+        )
+        logger.info(f"JSON checkpoint saved: {len(pending_cities)} cities pending for next run")
+    except Exception as e:
+        logger.warning(f"Failed to save JSON checkpoint: {e}")
 
     print(f"\n{'='*60}")
     print(f"DONE in {hours:02d}:{minutes:02d}:{seconds:02d}")

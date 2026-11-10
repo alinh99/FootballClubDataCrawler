@@ -16,7 +16,7 @@ from v4.config import (
 )
 from v4.models import AdaptiveLimiter
 from v4.types import (
-    CityName, ClubId, ClubRow, StatsDict, ClubInfoPayload
+    CityName, ClubId, ClubRow, StatsDict, ClubInfoPayload, ClubCache
 )
 from v4.utils.logging import log_error_with_context
 
@@ -31,6 +31,7 @@ async def fetch_club_info(
     city: CityName,
     limiter: AdaptiveLimiter,
     stats: StatsDict,
+    club_cache: ClubCache,
     dry_run: bool = False,
     latitude: float = 51.5074,
     longitude: float = -0.1278,
@@ -59,6 +60,23 @@ async def fetch_club_info(
         disability_type = []
     if search_id is None:
         search_id = str(uuid.uuid4())
+
+    # ===== CLUB CACHE: Return cached data if available =====
+    if club_id in club_cache:
+        cached_row = club_cache[club_id]
+        # Verify cached row has the required fields and matches requested club_id
+        # Use "is not None" to handle ClubId=0 correctly (0 is falsy but valid)
+        cached_club_id = cached_row.get("ClubId") if isinstance(cached_row, dict) else None
+        if (isinstance(cached_row, dict)
+            and cached_club_id is not None
+            and cached_club_id == club_id):  # Ensure cached ClubId matches requested
+            stats["skipped_cache"] += 1
+            logger.debug(f"[CACHE HIT] Club {club_id} found in cache, skipping API call")
+            return cached_row
+        else:
+            # Invalid cache entry or ClubId mismatch, remove it
+            logger.warning(f"[CACHE INVALID] Club {club_id}: cached={cached_club_id}, removing")
+            del club_cache[club_id]
 
     payload: ClubInfoPayload = {
         "ClubId": club_id,
@@ -205,6 +223,17 @@ async def fetch_club_info(
                     "GroundName": data.get("GroundName", "") or "",
                 }
 
+                # ===== CLUB CACHE: Store successful result =====
+                # Only cache if we have a valid club_id (not 0, None, empty)
+                # and the response contains a valid ClubId to avoid collisions
+                response_club_id = data.get("ClubId", club_id)
+                if club_id and response_club_id not in (0, None, "", "0"):
+                    club_cache[club_id] = row
+                    logger.debug(f"[CACHE STORE] Club {club_id} cached successfully")
+                elif club_id in (0, None, "", "0"):
+                    logger.warning(f"[CACHE SKIP] Invalid club_id={club_id}, not caching to avoid collisions")
+                else:
+                    logger.warning(f"[CACHE SKIP] Response ClubId={response_club_id} invalid, not caching")
                 stats["success"] += 1
                 return row
 

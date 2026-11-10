@@ -12,7 +12,7 @@ from curl_cffi import requests as curl_requests
 from v4.config import (
     API_CLUB_RECOMMENDATION_URL,
     KEY_CLUB_INFO_AND_RECOMMENDATION_INFO,
-    DEFAULT_LAT, DEFAULT_LON, CITY_COORDS, TOTAL_RETRIES
+    DEFAULT_LAT, DEFAULT_LON, CITY_COORDS, TOTAL_RETRIES, RATE_LIMIT_SLEEP
 )
 from v4.types import (
     CityName, RecommendationResponse, ClubsList,
@@ -105,7 +105,7 @@ def extract_full_club_data_from_recommendation(
     return clubs
 
 
-async def fetch_recommendation_pages(city: CityName, dry_run: bool = False) -> List[RecommendationResponse]:
+async def fetch_recommendation_pages(city: CityName, age: int = 0, play_with: int = 4, dry_run: bool = False) -> List[RecommendationResponse]:
     """
     Fetch all pages of club recommendations for a city.
     Returns list of API response objects.
@@ -124,9 +124,9 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False) -> L
     # PageNumber will increment, PageSize=12
     base_payload: RecommendationPayload = {
         "SearchForUser": "",
-        "Age": 0,
-        "PlayWith": 4,  # Website default (4 = all football types)
-        "FootballType": 4,
+        "Age": age,
+        "PlayWith": play_with,  # Use combo parameter
+        "FootballType": play_with,  # Match PlayWith
         "FootballTypeAllNone": "None",
         "WeekDays": "1,2,3,4,5,6,7",
         "Disabilityoption": 3,
@@ -145,7 +145,7 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False) -> L
         "SchoolYear": "",
         "ReadableLocation": city,
         "SearchId": "",
-        "SelectedFootballType": 4,
+        "SelectedFootballType": play_with,
         "SurfaceType": "3G or Astroturf,Grass,Indoor,Others",
         "quickSearch": True,
     }
@@ -188,6 +188,7 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False) -> L
                 result = await loop.run_in_executor(None, fetch_page, page)
                 if result is None:
                     # 204 No Content - no more pages
+                    logger.info(f"[{city}] Page {page}: 204 No Content - no more pages")
                     return all_results
                 if result:
                     all_results.append(result)
@@ -199,10 +200,34 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False) -> L
                 page += 1
                 break
             except Exception as e:
+                error_msg = str(e)
+                is_429 = "429" in error_msg
+                is_5xx = any(code in error_msg for code in ["500", "502", "503", "504"])
+                is_401_403 = any(code in error_msg for code in ["401", "403"])
+
                 log_error_with_context(
                     logger, f"Page {page} failed: {e}",
                     city=city, page=page, attempt=current_retry+1, error=e, level="warning"
                 )
-                await asyncio.sleep(min(0.5 * (2 ** current_retry) + random.random(), 10.0))
+
+                if is_401_403:
+                    # Auth failures - don't retry, fail fast
+                    logger.error(f"[{city}] Page {page}: Auth failed (401/403) - not retrying")
+                    raise
+
+                if is_429:
+                    # 429-specific: 60s → 120s → 240s... capped at 5 min
+                    sleep_time = min(RATE_LIMIT_SLEEP * (2 ** current_retry) + random.random() * 5, 300.0)
+                    logger.warning(f"[{city}] Page {page}: Rate limited (429) - backing off {sleep_time:.1f}s (attempt {current_retry+1})")
+                elif is_5xx:
+                    # 5xx: 60s + jitter
+                    sleep_time = RATE_LIMIT_SLEEP + random.random() * 5
+                    logger.warning(f"[{city}] Page {page}: Server error (5xx) - backing off {sleep_time:.1f}s (attempt {current_retry+1})")
+                else:
+                    # Other errors: exponential backoff capped at 10s
+                    sleep_time = min(0.5 * (2 ** current_retry) + random.random(), 10.0)
+                    logger.warning(f"[{city}] Page {page}: Error - backing off {sleep_time:.1f}s (attempt {current_retry+1})")
+
+                await asyncio.sleep(sleep_time)
 
     return all_results

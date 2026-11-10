@@ -29,9 +29,10 @@ CSV_BASIC_LOCK_FILE: Final[str] = os.path.join(STORAGE_FOLDER_NAME, "clubs_basic
 
 # ---------------- Config from .env ----------------
 MAX_PROCESSES: Final[int] = int(os.getenv("MAX_PROCESSES", 5))
-MAX_CONCURRENT_REQUESTS: Final[int] = int(os.getenv("MAX_CONCURRENT_REQUESTS", 2000))  # Initial/starting concurrency
-MAX_CONCURRENT_LIMIT: Final[int] = int(os.getenv("MAX_CONCURRENT_LIMIT", 100000))     # Hard ceiling (adaptive scales up to this)
-TOTAL_RETRIES: Final[int] = int(os.getenv("TOTAL_RETRIES", 1000000000))
+MAX_CONCURRENT_REQUESTS: Final[int] = int(os.getenv("MAX_CONCURRENT_REQUESTS", 100))  # Initial/starting concurrency
+MAX_CONCURRENT_LIMIT: Final[int] = int(os.getenv("MAX_CONCURRENT_LIMIT", 200))     # Hard ceiling (adaptive scales up to this)
+MAX_COMBO_CONCURRENCY: Final[int] = int(os.getenv("MAX_COMBO_CONCURRENCY", 5))        # Concurrent combos per city
+TOTAL_RETRIES: Final[int] = int(os.getenv("TOTAL_RETRIES", 100))
 BATCH_SAVE_SIZE: Final[int] = int(os.getenv("BATCH_SAVE_SIZE", 200))
 RATE_LIMIT_SLEEP: Final[int] = int(os.getenv("RATE_LIMIT_SLEEP", 60))
 

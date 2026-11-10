@@ -6,13 +6,21 @@ from typing import List, Set, Tuple
 from v4.types import CityName
 
 
+# Age range: 1 to 100 (as specified by user)
+AGE_GROUPS = list(range(5, 101))
+# PlayWith: 4 = all football types (from website default)
+PLAY_WITH_OPTIONS = [4]
+
+
 def build_pending_combos_for_city(city: CityName, existing_combo_set: Set[str]) -> List[Tuple[int, int]]:
     """
-    API uses Age=0 and PlayWith=4 (from website default payload) - returns all clubs.
-    Only one combo per city needed.
+    Build combos for each age 1-100 with PlayWith=4 (all football types).
+    Each (age, play_with) combination is a separate API call.
     """
     pending: List[Tuple[int, int]] = []
-    key = f"{city}__0"  # Single combo per city (age=0, play_with=default)
-    if key not in existing_combo_set:
-        pending.append((0, 0))  # age=0, play_with=0 (using defaults from payload)
+    for age in AGE_GROUPS:
+        for play_with in PLAY_WITH_OPTIONS:
+            key = f"{city}__{play_with}__{age}"
+            if key not in existing_combo_set:
+                pending.append((age, play_with))
     return pending
