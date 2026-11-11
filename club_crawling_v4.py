@@ -133,7 +133,7 @@ class AsyncCSVWriter:
         if self._writer_task is None or self._writer_task.done():
             self._stop_event.clear()
             self._writer_task = asyncio.create_task(self._writer_loop())
-            logger.debug(f"AsyncCSVWriter started for {self.csv_path}")
+            logger.info(f"AsyncCSVWriter started for {self.csv_path}")
 
     async def stop(self) -> None:
         """Stop the background writer and flush remaining rows."""
@@ -143,7 +143,7 @@ class AsyncCSVWriter:
         if self._writer_task:
             await self._writer_task
             self._writer_task = None
-        logger.debug(f"AsyncCSVWriter stopped for {self.csv_path}")
+        logger.info(f"AsyncCSVWriter stopped for {self.csv_path}")
 
     async def write_rows(self, rows: List[Dict[str, Any]]) -> None:
         """Add rows to the write queue (non-blocking)."""
@@ -202,7 +202,7 @@ class AsyncCSVWriter:
         # Run blocking I/O in thread pool
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _sync_write)
-        logger.debug(f"Wrote batch of {len(batch)} rows to {self.csv_path}")
+        logger.info(f"Wrote batch of {len(batch)} rows to {self.csv_path}")
 
 
 # Global writer instances (one per process)
@@ -550,7 +550,7 @@ async def fetch_club_info(
                                 else:
                                     logger.warning(f"Contact API non-JSON ({contact_resp.status_code}): {contact_resp.text[:100]}")
                         except Exception as e:
-                            logger.debug(f"Contact API error for {wgs_id}: {e}")
+                            logger.info(f"Contact API error for {wgs_id}: {e}")
 
                 club_name = (data.get("ClubName", "") or "").strip()
                 if not club_name:

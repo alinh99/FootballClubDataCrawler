@@ -71,7 +71,7 @@ async def fetch_club_info(
             and cached_club_id is not None
             and cached_club_id == club_id):  # Ensure cached ClubId matches requested
             stats["skipped_cache"] += 1
-            logger.debug(f"[CACHE HIT] Club {club_id} found in cache, skipping API call")
+            logger.info(f"[CACHE HIT] Club {club_id} found in cache, skipping API call")
             return cached_row
         else:
             # Invalid cache entry or ClubId mismatch, remove it
@@ -178,7 +178,7 @@ async def fetch_club_info(
                                 else:
                                     logger.warning(f"Contact API non-JSON ({contact_resp.status_code}): {contact_resp.text[:100]}")
                         except Exception as e:
-                            logger.debug(f"Contact API error for {wgs_id}: {e}")
+                            logger.info(f"Contact API error for {wgs_id}: {e}")
 
                 club_name = (data.get("ClubName", "") or "").strip()
                 if not club_name:
@@ -229,7 +229,7 @@ async def fetch_club_info(
                 response_club_id = data.get("ClubId", club_id)
                 if club_id and response_club_id not in (0, None, "", "0"):
                     club_cache[club_id] = row
-                    logger.debug(f"[CACHE STORE] Club {club_id} cached successfully")
+                    logger.info(f"[CACHE STORE] Club {club_id} cached successfully")
                 elif club_id in (0, None, "", "0"):
                     logger.warning(f"[CACHE SKIP] Invalid club_id={club_id}, not caching to avoid collisions")
                 else:
