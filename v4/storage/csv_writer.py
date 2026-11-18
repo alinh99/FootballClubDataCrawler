@@ -33,8 +33,10 @@ class AsyncCSVWriter:
         self.queue: asyncio.Queue = asyncio.Queue()
         self._writer_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+        self._flush_event = asyncio.Event()  # Signal to flush current batch immediately
         self._lock = FileLock(lock_path, timeout=30)
         self._header_written = os.path.exists(csv_path)
+        self._write_in_progress = False  # Track if write is in progress
 
     async def start(self) -> None:
         """Start the background writer task."""
@@ -60,32 +62,60 @@ class AsyncCSVWriter:
         for row in rows:
             await self.queue.put(row)
 
+    async def flush(self) -> None:
+        """Flush pending rows - wait for queue and current write to complete."""
+        # Signal the writer to flush immediately
+        self._flush_event.set()
+        # Yield to event loop so writer task can start processing
+        await asyncio.sleep(0)
+        # Wait for queue to be processed
+        await self.queue.join()
+        # Wait for any in-progress write to complete
+        while self._write_in_progress:
+            await asyncio.sleep(0.05)
+        # Clear the flush event for next use
+        self._flush_event.clear()
+        logger.debug(f"AsyncCSVWriter flushed for {self.csv_path}")
+
     async def _writer_loop(self) -> None:
         """Background loop that batches and writes rows to CSV."""
         batch: List[Dict[str, Any]] = []
 
         while not self._stop_event.is_set() or not self.queue.empty():
             try:
-                # Collect batch with timeout
+                # Collect batch with timeout, but check flush event each iteration
                 while len(batch) < self.batch_size:
                     try:
-                        row = await asyncio.wait_for(
-                            self.queue.get(),
-                            timeout=0.5 if not self._stop_event.is_set() else 0.1
-                        )
+                        # Use shorter timeout when flush is requested to be responsive
+                        timeout = 0.1 if self._flush_event.is_set() else (0.5 if not self._stop_event.is_set() else 0.1)
+                        row = await asyncio.wait_for(self.queue.get(), timeout=timeout)
                         batch.append(row)
                         self.queue.task_done()
                     except asyncio.TimeoutError:
-                        break
+                        # Timeout - check if we should flush or continue
+                        if self._flush_event.is_set() or self._stop_event.is_set():
+                            break
+                        continue
+                    except Exception:
+                        pass
 
-                if batch:
+                # Check if flush was requested or stop event
+                flush_requested = self._flush_event.is_set()
+
+                if batch and (len(batch) >= self.batch_size or flush_requested or self._stop_event.is_set()):
+                    self._write_in_progress = True
                     await self._write_batch(batch)
                     batch.clear()
+                    self._write_in_progress = False
+                    if flush_requested:
+                        self._flush_event.clear()
 
             except asyncio.CancelledError:
                 # Flush remaining on cancel
                 if batch:
+                    self._write_in_progress = True
                     await self._write_batch(batch)
+                    self._write_in_progress = False
                 raise
             except Exception as e:
                 logger.error(f"AsyncCSVWriter error for {self.csv_path}: {e}", exc_info=True)
@@ -128,15 +158,7 @@ async def get_csv_writer() -> AsyncCSVWriter:
     return _csv_writer
 
 
-async def get_csv_basic_writer() -> AsyncCSVWriter:
-    """Get or create the global CSV writer for basic data."""
-    global _csv_basic_writer
-    if _csv_basic_writer is None:
-        _csv_basic_writer = AsyncCSVWriter(CSV_BASIC_FILE, CSV_BASIC_LOCK_FILE)
-        await _csv_basic_writer.start()
-    return _csv_basic_writer
-
-
+# Basic CSV is written synchronously for reliability
 async def async_append_csv_rows_safe(rows: List[ClubRow]) -> None:
     """
     Non-blocking CSV append for detailed club data using background writer queue.
@@ -150,13 +172,27 @@ async def async_append_csv_rows_safe(rows: List[ClubRow]) -> None:
 
 async def async_append_basic_csv_rows(rows: List[BasicClubRow]) -> None:
     """
-    Non-blocking CSV append for basic club data (from recommendation API).
-    Written immediately after recommendation data is available.
+    Synchronous CSV append for basic club data (from recommendation API).
+    Written immediately and flushed to disk.
     """
     if not rows:
         return
-    writer = await get_csv_basic_writer()
-    await writer.write_rows(rows)
+
+    def _sync_write():
+        import pandas as pd
+        from filelock import FileLock
+        df = pd.DataFrame(rows)
+        # Ensure consistent column order
+        main_cols = ["City", "PlayWith", "Age"]
+        other_cols = [c for c in df.columns if c not in main_cols]
+        df = df[main_cols + other_cols]
+        header = not os.path.exists(CSV_BASIC_FILE)
+        with FileLock(CSV_BASIC_LOCK_FILE, timeout=30):
+            df.to_csv(CSV_BASIC_FILE, mode="a", index=False, header=header)
+        logger.debug(f"Wrote {len(rows)} basic rows to {CSV_BASIC_FILE}")
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _sync_write)
 
 
 async def close_csv_writer() -> None:
@@ -168,11 +204,13 @@ async def close_csv_writer() -> None:
 
 
 async def close_csv_basic_writer() -> None:
-    """Close the global CSV writer for basic data."""
-    global _csv_basic_writer
-    if _csv_basic_writer:
-        await _csv_basic_writer.stop()
-        _csv_basic_writer = None
+    """Close the global CSV writer for basic data (no-op for sync writer)."""
+    pass
+
+
+async def flush_csv_basic_writer() -> None:
+    """Flush the basic CSV writer - no-op for sync writer (already flushed on each write)."""
+    pass
 
 
 async def close_all_csv_writers() -> None:

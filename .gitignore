@@ -9,3 +9,5 @@ storage/
 *.lock
 output/
 logs/
+*venv*
+downloaded_files/

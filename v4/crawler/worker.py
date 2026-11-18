@@ -14,9 +14,10 @@ from multiprocessing.synchronize import Lock as LockProxy
 from v4.config import MAX_CONCURRENT_REQUESTS, MAX_CONCURRENT_LIMIT, TOTAL_RETRIES, MAX_COMBO_CONCURRENCY
 from v4.models import AdaptiveLimiter
 from v4.api import fetch_recommendation_pages, fetch_club_info, extract_full_club_data_from_recommendation
+from v4.crawler.phase.phase2 import process_phase2
 from v4.storage import (
     atomic_pickle_dump, async_append_csv_rows_safe,
-    async_append_basic_csv_rows, safe_load_pickle, close_all_csv_writers,
+    async_append_basic_csv_rows, flush_csv_basic_writer, safe_load_pickle, close_all_csv_writers,
     save_checkpoint_json
 )
 from v4.types import (
@@ -36,7 +37,9 @@ async def process_combo_async(
     play_with: int,
     stats: StatsDict,
     club_cache: ClubCache,
-    dry_run: bool = False
+    dry_run: bool = False,
+    limit: int = 0,
+    max_booking_urls: int = 0
 ) -> List[ClubRow]:
     """
     Process a single city combo.
@@ -45,7 +48,7 @@ async def process_combo_async(
     """
     combo_key = f"{city}__{play_with}__{age}"
     limiter = AdaptiveLimiter(MAX_CONCURRENT_REQUESTS, min_concurrent=5, max_concurrent=MAX_CONCURRENT_LIMIT)
-    api_general_info_data = await fetch_recommendation_pages(city, age, play_with, dry_run)
+    api_general_info_data = await fetch_recommendation_pages(city, dry_run, limit)
 
     # Extract ALL fields from recommendation API response
     clubs_data = extract_full_club_data_from_recommendation(api_general_info_data)
@@ -56,10 +59,11 @@ async def process_combo_async(
     basic_rows: List[BasicClubRow] = []
     club_ids_to_fetch_detail: List[str] = []
 
+    # Combo fields that should NOT be overwritten by API response
+    combo_fields = {"City", "PlayWith", "Age", "ClubId"}
+
     for club_data in clubs_data:
         club_id = club_data.get("ClubId", "")
-        if not club_id:
-            continue
 
         # Build basic row with ACTUAL combo values
         basic_row: BasicClubRow = {
@@ -69,9 +73,9 @@ async def process_combo_async(
             "ClubId": club_id,
             "Source": "recommendation",
         }
-        # Add all fields from recommendation response
+        # Add all fields from recommendation response EXCEPT combo fields
         for key, value in club_data.items():
-            if key != "ClubId":  # Already added above
+            if key not in combo_fields:
                 basic_row[key] = value
 
         basic_rows.append(basic_row)
@@ -79,35 +83,27 @@ async def process_combo_async(
 
     if basic_rows:
         await async_append_basic_csv_rows(basic_rows)
+        await flush_csv_basic_writer()
         logger.info(f"[{city}] Phase 1: Written {len(basic_rows)} basic club rows (Age={age}, PlayWith={play_with})")
 
     # ===== PHASE 2: Fetch detailed info and write to detail CSV =====
-    # Only fetch detail for clubs that need additional info not in recommendation
-    rows_to_save: List[ClubRow] = []
+    # Use phase2 module which reads from clubs_basic.csv and processes sequentially
+    # Apply limit to club_ids_to_fetch_detail to respect the global club limit
+    if limit > 0:
+        club_ids_to_fetch_detail = club_ids_to_fetch_detail[:limit]
+        logger.info(f"[{city}] Phase 2: Limited to {len(club_ids_to_fetch_detail)} clubs (limit={limit})")
 
-    from curl_cffi import AsyncSession
-    async with AsyncSession(impersonate="chrome120", timeout=300.0) as client:
-        tasks = []
-        for club_id in club_ids_to_fetch_detail:
-            # Find the club data from recommendation to extract additional fields
-            club_data = next((c for c in clubs_data if c.get("ClubId") == club_id), {})
-            tasks.append(
-                fetch_club_info(
-                    client, club_id, age, play_with, city, limiter, stats, club_cache, dry_run,
-                    latitude=club_data.get("Latitude", 51.5074),
-                    longitude=club_data.get("Longitude", -0.1278),
-                    week_days=club_data.get("WeekDays", "1,2,3,4,5,6,7"),
-                    disability_option=club_data.get("Disabilityoption", 3),
-                    disability_type=club_data.get("DisabilityType", []),
-                    school_year=club_data.get("SchoolYear", ""),
-                    football_type=club_data.get("FootballType", "U10"),
-                    search_id=club_data.get("SearchId", None)
-                )
-            )
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-    for r in raw_results:
-        if isinstance(r, dict):
-            rows_to_save.append(r)
+    rows_to_save = await process_phase2(
+        city=city,
+        age=age,
+        play_with=play_with,
+        clubs_data=clubs_data,  # for backward compatibility
+        club_ids_to_fetch_detail=club_ids_to_fetch_detail,
+        stats=stats,
+        club_cache=club_cache,
+        dry_run=dry_run,
+        max_booking_urls=max_booking_urls
+    )
     return rows_to_save
 
 
@@ -119,6 +115,8 @@ async def process_combo_with_retry(
     club_cache: ClubCache,
     processed_combos_global: Set[str],
     dry_run: bool = False,
+    limit: int = 0,
+    max_booking_urls: int = 0,
     max_retries: int = TOTAL_RETRIES
 ) -> Tuple[List[ClubRow], bool]:
     """
@@ -129,7 +127,7 @@ async def process_combo_with_retry(
 
     for attempt in range(1, max_retries + 1):
         try:
-            rows = await process_combo_async(city, age, play_with, stats, club_cache, dry_run)
+            rows = await process_combo_async(city, age, play_with, stats, club_cache, dry_run, limit, max_booking_urls)
             return rows, True
         except Exception as e:
             log_error_with_context(
@@ -155,6 +153,7 @@ async def process_city_combos_concurrent(
     processed_combos_global: ProcessedCombos,
     dry_run: bool,
     limit: int,
+    max_booking_urls: int,
     clubs_saved_counter: Any,
     clubs_saved_lock: Any,
     shared_counter: Any,
@@ -165,14 +164,16 @@ async def process_city_combos_concurrent(
     Process multiple combos concurrently for a city.
     Uses semaphore to limit concurrent combos.
     """
+    logger.info(f"[{city}] process_city_combos_concurrent started with {len(pending_combos)} combos, limit={limit}")
     semaphore = asyncio.Semaphore(MAX_COMBO_CONCURRENCY)
 
     async def process_one_combo(age: int, play_with: int):
         combo_key = f"{city}__{play_with}__{age}"
+        logger.info(f"[{city}] process_one_combo called for Age={age}, PW={play_with}")
 
         # Check if already processed
         if combo_key in processed_combos_global:
-            async with shared_lock:
+            with shared_lock:
                 shared_counter.value += 1
             pbar.update(1)
             logger.info(f"[{city}] SKIP: Age={age}, PW={play_with} (already done)")
@@ -180,21 +181,26 @@ async def process_city_combos_concurrent(
 
         logger.info(f"[{city}] START: Age={age}, PW={play_with}")
         async with semaphore:
+            logger.info(f"[{city}] Acquired semaphore for Age={age}, PW={play_with}")
             # Check limit before processing
             if limit > 0 and clubs_saved_counter:
-                async with clubs_saved_lock:
+                with clubs_saved_lock:
                     if clubs_saved_counter.value >= limit:
+                        logger.info(f"[{city}] Limit reached before processing, returning")
                         return
 
+            logger.info(f"[{city}] Calling process_combo_with_retry for Age={age}, PW={play_with}")
             rows, success = await process_combo_with_retry(
-                city, age, play_with, stats, club_cache, processed_combos_global, dry_run
+                city, age, play_with, stats, club_cache, processed_combos_global, dry_run, limit, max_booking_urls
             )
+            logger.info(f"[{city}] process_combo_with_retry returned: success={success}, rows={len(rows) if rows else 0}")
 
             if success and rows:
                 # Check limit again before saving
                 if limit > 0 and clubs_saved_counter:
-                    async with clubs_saved_lock:
+                    with clubs_saved_lock:
                         if clubs_saved_counter.value >= limit:
+                            logger.info(f"[{city}] Limit reached after processing, returning")
                             return
                         remaining = limit - clubs_saved_counter.value
                         if len(rows) > remaining:
@@ -229,12 +235,20 @@ async def process_city_combos_concurrent(
                 logger.warning(f"City {city} Age={age} PW={play_with} combo failed — NOT marking as done, will retry next run")
 
             pbar.update(1)
-            async with shared_lock:
+            with shared_lock:
                 shared_counter.value += 1
+            logger.info(f"[{city}] process_one_combo finished for Age={age}, PW={play_with}")
 
     # Create tasks for all combos
+    logger.info(f"[{city}] Creating {len(pending_combos)} tasks")
     tasks = [process_one_combo(age, play_with) for age, play_with in pending_combos]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info(f"[{city}] Awaiting gather...")
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info(f"[{city}] Gather completed, results: {results}")
+    # Check for exceptions
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            logger.error(f"[{city}] Task {i} raised exception: {result}", exc_info=result)
 
 
 def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
@@ -251,9 +265,10 @@ def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
     clubs_saved_counter = args.get("clubs_saved_counter")
     clubs_saved_lock = args.get("clubs_saved_lock")
     limit = args.get("limit", 0)
+    max_booking_urls = args.get("max_booking_urls", 0)
 
     start = time.time()
-    logger.info(f"Process start for city {city}, combos={len(pending_combos)}, dry_run={dry_run}, limit={limit}, combo_concurrency={MAX_COMBO_CONCURRENCY}")
+    logger.info(f"Process start for city {city}, combos={len(pending_combos)}, dry_run={dry_run}, limit={limit}, max_booking_urls={max_booking_urls}, combo_concurrency={MAX_COMBO_CONCURRENCY}")
 
     processed_combos_global = safe_load_pickle("storage/processed_combos.pkl", set()) or set()
     club_cache = safe_load_pickle("storage/club_cache.pkl", {}) or {}
@@ -276,6 +291,7 @@ def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
             processed_combos_global=processed_combos_global,
             dry_run=dry_run,
             limit=limit,
+            max_booking_urls=max_booking_urls,
             clubs_saved_counter=clubs_saved_counter,
             clubs_saved_lock=clubs_saved_lock,
             shared_counter=shared_counter,

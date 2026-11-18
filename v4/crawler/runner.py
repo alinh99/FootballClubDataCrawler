@@ -29,7 +29,8 @@ def run_crawler(
     cities: List[CityName],
     dry_run: bool = False,
     limit: int = 0,
-    max_combos: int = 0
+    max_combos: int = 0,
+    max_booking_urls: int = 0
 ) -> None:
     """
     Run the crawler for multiple cities using multiprocessing + asyncio.
@@ -78,7 +79,7 @@ def run_crawler(
             else:
                 combos_added += len(pending)
 
-            city_args.append({"city": city, "pending_combos": pending, "dry_run": dry_run})
+            city_args.append({"city": city, "pending_combos": pending, "dry_run": dry_run, "max_booking_urls": max_booking_urls})
             total_pending_combos += len(pending)
         else:
             logger.info(f"City {city} already fully completed, skipping.")
@@ -99,6 +100,8 @@ def run_crawler(
         print(f"Club limit: {limit}")
     if max_combos > 0:
         print(f"Max combos: {max_combos}")
+    if max_booking_urls > 0:
+        print(f"Max booking URLs per club: {max_booking_urls}")
     print(f"{'='*60}\n")
 
     # Shared counter for overall progress

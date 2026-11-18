@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Run without making API calls")
     parser.add_argument("--limit", type=int, default=0, help="Max clubs to fetch (0 = unlimited)")
     parser.add_argument("--max-combos", type=int, default=0, help="Max city combos to process (0 = all)")
+    parser.add_argument("--max-booking-urls", type=int, default=0, help="Max booking URLs per club (0 = unlimited)")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint (default: auto)")
     return parser.parse_args()
 
@@ -60,10 +61,11 @@ def main() -> int:
     logger.info(f"Dry run: {args.dry_run}")
     logger.info(f"Max clubs limit: {args.limit if args.limit > 0 else 'unlimited'}")
     logger.info(f"Max combos: {args.max_combos if args.max_combos > 0 else 'all'}")
+    logger.info(f"Max booking URLs per club: {args.max_booking_urls if args.max_booking_urls > 0 else 'unlimited'}")
 
     # Run crawler
     try:
-        run_crawler(cities, args.dry_run, args.limit, args.max_combos)
+        run_crawler(cities, args.dry_run, args.limit, args.max_combos, args.max_booking_urls)
         logger.info("=" * 60)
         logger.info("✅ Crawl completed successfully")
         logger.info("=" * 60)

@@ -2,12 +2,12 @@
 CSV reading utilities for v4 crawler.
 """
 import logging
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Any
 
 import pandas as pd
 import os
 
-from v4.config import CSV_FILE, CITY_COLUMN, INPUT_FILE
+from v4.config import CSV_FILE, CSV_BASIC_FILE, CITY_COLUMN, INPUT_FILE
 from v4.types import CityName, ExistingClubNames, ProcessedCombos
 
 logger = logging.getLogger(__name__)
@@ -83,3 +83,52 @@ def get_processed_combos_from_csv(csv_path: str = CSV_FILE) -> ProcessedCombos:
     except Exception as e:
         logger.warning(f"get_processed_combos_from_csv failed: {e}")
         return set()
+
+
+def load_clubs_basic_by_combo(
+    city: CityName,
+    age: int,
+    play_with: int,
+    csv_path: str = CSV_BASIC_FILE
+) -> List[Dict[str, Any]]:
+    """
+    Load clubs from basic CSV filtered by city, age, play_with.
+    Returns all entries (including duplicates with different BookingURLs) for Phase 2.
+    - City filter is case-insensitive
+    - Age=0 means wildcard (match all ages)
+    """
+    import os
+    if not os.path.exists(csv_path):
+        logger.warning(f"[{city}] clubs_basic.csv not found at {csv_path}")
+        return []
+    try:
+        df = pd.read_csv(csv_path)
+        logger.info(f"[{city}] CSV loaded: {len(df)} rows, City values: {df.get('City', pd.Series()).unique()}, PlayWith: {df.get('PlayWith', pd.Series()).unique()}, Age: {df.get('Age', pd.Series()).unique()}")
+
+        # Case-insensitive city filter
+        city_mask = df.get("City", "").astype(str).str.lower() == city.lower()
+        logger.info(f"[{city}] city_mask matches: {city_mask.sum()}")
+
+        # PlayWith filter (exact match)
+        play_with_mask = df.get("PlayWith", "").astype(str) == str(play_with)
+        logger.info(f"[{city}] play_with_mask matches: {play_with_mask.sum()}")
+
+        # Age filter: age=0 means wildcard (match all ages)
+        if age == 0:
+            age_mask = True  # Match all ages
+        else:
+            age_mask = df.get("Age", "").astype(str) == str(age)
+
+        if age_mask is True:
+            mask = city_mask & play_with_mask
+        else:
+            mask = city_mask & age_mask & play_with_mask
+        logger.info(f"[{city}] final mask matches: {mask.sum()}")
+
+        filtered = df[mask]
+        clubs = filtered.to_dict('records')
+        logger.info(f"[{city}] Loaded {len(clubs)} basic club entries for Age={age}, PlayWith={play_with} from clubs_basic.csv")
+        return clubs
+    except Exception as e:
+        logger.warning(f"load_clubs_basic_by_combo failed for {city} Age={age} PW={play_with}: {e}", exc_info=True)
+        return []

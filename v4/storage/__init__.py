@@ -21,11 +21,11 @@ from v4.storage.json_checkpoint import (
 from v4.storage.csv_writer import (
     AsyncCSVWriter,
     get_csv_writer,
-    get_csv_basic_writer,
     async_append_csv_rows_safe,
     async_append_basic_csv_rows,
     close_csv_writer,
     close_csv_basic_writer,
+    flush_csv_basic_writer,
     close_all_csv_writers,
 )
 
@@ -35,6 +35,7 @@ from v4.storage.csv_utils import (
     load_existing_output_info,
     load_cities,
     get_processed_combos_from_csv,
+    load_clubs_basic_by_combo,
 )
 
 # Checkpoint utilities (legacy pickle)
@@ -63,12 +64,14 @@ __all__ = [
     "async_append_basic_csv_rows",
     "close_csv_writer",
     "close_csv_basic_writer",
+    "flush_csv_basic_writer",
     "close_all_csv_writers",
     # CSV Reading
     "load_existing_csv",
     "load_existing_output_info",
     "load_cities",
     "get_processed_combos_from_csv",
+    "load_clubs_basic_by_combo",
     # Checkpoint (legacy)
     "save_checkpoint",
     "load_checkpoint",

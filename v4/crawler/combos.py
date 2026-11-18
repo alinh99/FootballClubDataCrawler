@@ -3,18 +3,13 @@ Combo building utilities for v4 crawler.
 """
 from typing import List, Set, Tuple
 
+from v4.config import AGE_GROUPS, PLAY_WITH_OPTIONS
 from v4.types import CityName
-
-
-# Age range: 5 to 69 (as specified by user)
-AGE_GROUPS = list(range(5, 70))
-# PlayWith: 4 = all football types (from website default)
-PLAY_WITH_OPTIONS = [4]
 
 
 def build_pending_combos_for_city(city: CityName, existing_combo_set: Set[str]) -> List[Tuple[int, int]]:
     """
-    Build combos for each age 5-69 with PlayWith=4 (all football types).
+    Build combos for each age with PlayWith options.
     Each (age, play_with) combination is a separate API call.
     """
     pending: List[Tuple[int, int]] = []

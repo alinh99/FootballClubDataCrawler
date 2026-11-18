@@ -2,7 +2,7 @@
 Configuration constants for v4 crawler.
 """
 import os
-from typing import Dict, Final, Optional
+from typing import Dict, Final, List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -35,6 +35,10 @@ MAX_COMBO_CONCURRENCY: Final[int] = int(os.getenv("MAX_COMBO_CONCURRENCY", 5))  
 TOTAL_RETRIES: Final[int] = int(os.getenv("TOTAL_RETRIES", 100))
 BATCH_SAVE_SIZE: Final[int] = int(os.getenv("BATCH_SAVE_SIZE", 200))
 RATE_LIMIT_SLEEP: Final[int] = int(os.getenv("RATE_LIMIT_SLEEP", 60))
+
+# ---------------- Age Groups & Play With Options ----------------
+AGE_GROUPS: Final[List[int]] = [0]
+PLAY_WITH_OPTIONS: Final[List[int]] = [7]
 
 # ---------------- API Endpoints ----------------
 API_CLUB_RECOMMENDATION_URL: Final[str] = os.getenv(

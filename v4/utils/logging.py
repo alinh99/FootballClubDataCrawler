@@ -15,6 +15,7 @@ def log_error_with_context(
     city: Optional[CityName] = None,
     club_id: Optional[ClubId] = None,
     club_name: Optional[str] = None,
+    age: Optional[int] = None,
     page: Optional[int] = None,
     attempt: Optional[int] = None,
     error: Optional[Exception] = None,
@@ -36,6 +37,8 @@ def log_error_with_context(
         context_parts.append(f"ClubID: {club_id}")
     if club_name:
         context_parts.append(f"ClubName: '{club_name}'")
+    if age is not None:
+        context_parts.append(f"Age: {age}")
     if page is not None:
         context_parts.append(f"Page: {page}")
     if attempt is not None:
