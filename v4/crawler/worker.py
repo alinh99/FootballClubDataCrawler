@@ -15,10 +15,11 @@ from v4.config import MAX_CONCURRENT_REQUESTS, MAX_CONCURRENT_LIMIT, TOTAL_RETRI
 from v4.models import AdaptiveLimiter
 from v4.api import fetch_recommendation_pages, fetch_club_info, extract_full_club_data_from_recommendation
 from v4.crawler.phase.phase2 import process_phase2
+from v4.eta import ETACalculator, PhaseETACalculator
 from v4.storage import (
-    atomic_pickle_dump, async_append_csv_rows_safe,
+    atomic_pickle_dump, async_atomic_pickle_dump, async_append_csv_rows_safe,
     async_append_basic_csv_rows, flush_csv_basic_writer, safe_load_pickle, close_all_csv_writers,
-    save_checkpoint_json
+    save_checkpoint_json, async_save_checkpoint_json
 )
 from v4.types import (
     CityName, ClubRow, BasicClubRow, StatsDict, WorkerArgs, ProcessedCombos, ClubCache
@@ -39,7 +40,8 @@ async def process_combo_async(
     club_cache: ClubCache,
     dry_run: bool = False,
     limit: int = 0,
-    max_booking_urls: int = 0
+    max_booking_urls: int = 0,
+    phase2_only: bool = False
 ) -> List[ClubRow]:
     """
     Process a single city combo.
@@ -48,62 +50,99 @@ async def process_combo_async(
     """
     combo_key = f"{city}__{play_with}__{age}"
     limiter = AdaptiveLimiter(MAX_CONCURRENT_REQUESTS, min_concurrent=5, max_concurrent=MAX_CONCURRENT_LIMIT)
-    api_general_info_data = await fetch_recommendation_pages(city, dry_run, limit)
 
-    # Extract ALL fields from recommendation API response
-    clubs_data = extract_full_club_data_from_recommendation(api_general_info_data)
-    if not clubs_data:
-        return []
+    # ETA calculator for this combo
+    phase_eta = PhaseETACalculator(total_combos=1)
 
-    # ===== PHASE 1: Write ALL available club info from recommendation API immediately =====
-    basic_rows: List[BasicClubRow] = []
-    club_ids_to_fetch_detail: List[str] = []
+    if not phase2_only:
+        # ===== PHASE 1: Write ALL available club info from recommendation API immediately =====
+        api_general_info_data = await fetch_recommendation_pages(city, dry_run, limit)
 
-    # Combo fields that should NOT be overwritten by API response
-    combo_fields = {"City", "PlayWith", "Age", "ClubId"}
+        # Extract ALL fields from recommendation API response
+        clubs_data = extract_full_club_data_from_recommendation(api_general_info_data)
+        if not clubs_data:
+            return []
 
-    for club_data in clubs_data:
-        club_id = club_data.get("ClubId", "")
+        basic_rows: List[BasicClubRow] = []
+        club_ids_to_fetch_detail: List[str] = []
 
-        # Build basic row with ACTUAL combo values
-        basic_row: BasicClubRow = {
-            "City": city,
-            "PlayWith": play_with,
-            "Age": age,
-            "ClubId": club_id,
-            "Source": "recommendation",
-        }
-        # Add all fields from recommendation response EXCEPT combo fields
-        for key, value in club_data.items():
-            if key not in combo_fields:
-                basic_row[key] = value
+        # Combo fields that should NOT be overwritten by API response
+        combo_fields = {"City", "PlayWith", "Age", "ClubId"}
 
-        basic_rows.append(basic_row)
-        club_ids_to_fetch_detail.append(club_id)
+        for club_data in clubs_data:
+            club_id = club_data.get("ClubId", "")
 
-    if basic_rows:
-        await async_append_basic_csv_rows(basic_rows)
-        await flush_csv_basic_writer()
-        logger.info(f"[{city}] Phase 1: Written {len(basic_rows)} basic club rows (Age={age}, PlayWith={play_with})")
+            # Build basic row with ACTUAL combo values
+            basic_row: BasicClubRow = {
+                "City": city,
+                "PlayWith": play_with,
+                "Age": age,
+                "ClubId": club_id,
+                "Source": "recommendation",
+            }
+            # Add all fields from recommendation response EXCEPT combo fields
+            for key, value in club_data.items():
+                if key not in combo_fields:
+                    basic_row[key] = value
 
-    # ===== PHASE 2: Fetch detailed info and write to detail CSV =====
-    # Use phase2 module which reads from clubs_basic.csv and processes sequentially
-    # Apply limit to club_ids_to_fetch_detail to respect the global club limit
-    if limit > 0:
-        club_ids_to_fetch_detail = club_ids_to_fetch_detail[:limit]
-        logger.info(f"[{city}] Phase 2: Limited to {len(club_ids_to_fetch_detail)} clubs (limit={limit})")
+            basic_rows.append(basic_row)
+            club_ids_to_fetch_detail.append(club_id)
 
-    rows_to_save = await process_phase2(
-        city=city,
-        age=age,
-        play_with=play_with,
-        clubs_data=clubs_data,  # for backward compatibility
-        club_ids_to_fetch_detail=club_ids_to_fetch_detail,
-        stats=stats,
-        club_cache=club_cache,
-        dry_run=dry_run,
-        max_booking_urls=max_booking_urls
-    )
+        # Phase 1 ETA tracking
+        phase_eta.start_phase1(len(basic_rows))
+        for i, _ in enumerate(basic_rows, 1):
+            phase_eta.update_phase1(i)
+        phase_eta.log_phase1(logger, city, force=True)
+
+        if basic_rows:
+            await async_append_basic_csv_rows(basic_rows)
+            await flush_csv_basic_writer()
+            logger.info(f"[{city}] Phase 1: Written {len(basic_rows)} basic club rows (Age={age}, PlayWith={play_with})")
+
+        # Apply limit to club_ids_to_fetch_detail to respect the global club limit
+        if limit > 0:
+            club_ids_to_fetch_detail = club_ids_to_fetch_detail[:limit]
+            logger.info(f"[{city}] Phase 2: Limited to {len(club_ids_to_fetch_detail)} clubs (limit={limit})")
+
+        # Phase 2 ETA tracking
+        phase_eta.start_phase2(len(club_ids_to_fetch_detail))
+
+        rows_to_save = await process_phase2(
+            city=city,
+            age=age,
+            play_with=play_with,
+            clubs_data=clubs_data,  # for backward compatibility
+            club_ids_to_fetch_detail=club_ids_to_fetch_detail,
+            stats=stats,
+            club_cache=club_cache,
+            dry_run=dry_run,
+            max_booking_urls=max_booking_urls,
+            raise_on_fetch_error=True
+        )
+
+        # Log Phase 2 completion
+        phase_eta.update_phase2(len(club_ids_to_fetch_detail))
+        phase_eta.log_phase2(logger, city, force=True)
+    else:
+        # ===== PHASE 2 ONLY: Skip Phase 1, use existing clubs_basic.csv =====
+        logger.info(f"[{city}] Phase 2 ONLY: Skipping Phase 1, using existing clubs_basic.csv")
+
+        # Phase 2 will load clubs from clubs_basic.csv directly
+        # The clubs_data parameter is unused in phase2 (kept for backward compatibility)
+        clubs_data = []
+
+        rows_to_save = await process_phase2(
+            city=city,
+            age=age,
+            play_with=play_with,
+            clubs_data=clubs_data,  # unused in phase2
+            club_ids_to_fetch_detail=[],  # unused in phase2
+            stats=stats,
+            club_cache=club_cache,
+            dry_run=dry_run,
+            max_booking_urls=max_booking_urls,
+            raise_on_fetch_error=True
+        )
     return rows_to_save
 
 
@@ -117,7 +156,8 @@ async def process_combo_with_retry(
     dry_run: bool = False,
     limit: int = 0,
     max_booking_urls: int = 0,
-    max_retries: int = TOTAL_RETRIES
+    max_retries: int = TOTAL_RETRIES,
+    phase2_only: bool = False
 ) -> Tuple[List[ClubRow], bool]:
     """
     Process a single combo with retry logic.
@@ -127,12 +167,12 @@ async def process_combo_with_retry(
 
     for attempt in range(1, max_retries + 1):
         try:
-            rows = await process_combo_async(city, age, play_with, stats, club_cache, dry_run, limit, max_booking_urls)
+            rows = await process_combo_async(city, age, play_with, stats, club_cache, dry_run, limit, max_booking_urls, phase2_only)
             return rows, True
         except Exception as e:
             log_error_with_context(
                 logger, f"City {city} Age={age} PW={play_with} attempt {attempt} failed: {e}",
-                city=city, age=age, play_with=play_with, attempt=attempt, error=e, level="warning"
+                city=city, age=age, attempt=attempt, error=e, level="warning"
             )
             if attempt < max_retries:
                 sleep_time = min(0.5 * (2 ** attempt) + random.random(), 10.0)
@@ -140,7 +180,7 @@ async def process_combo_with_retry(
             else:
                 log_error_with_context(
                     logger, f"City {city} Age={age} PW={play_with} max retries reached",
-                    city=city, age=age, play_with=play_with, attempt=attempt, error=e, level="error"
+                    city=city, age=age, attempt=attempt, error=e, level="error"
                 )
     return [], False
 
@@ -158,7 +198,8 @@ async def process_city_combos_concurrent(
     clubs_saved_lock: Any,
     shared_counter: Any,
     shared_lock: Any,
-    pbar: tqdm
+    pbar: tqdm,
+    phase2_only: bool = False
 ) -> None:
     """
     Process multiple combos concurrently for a city.
@@ -191,7 +232,7 @@ async def process_city_combos_concurrent(
 
             logger.info(f"[{city}] Calling process_combo_with_retry for Age={age}, PW={play_with}")
             rows, success = await process_combo_with_retry(
-                city, age, play_with, stats, club_cache, processed_combos_global, dry_run, limit, max_booking_urls
+                city, age, play_with, stats, club_cache, processed_combos_global, dry_run, limit, max_booking_urls, phase2_only=phase2_only
             )
             logger.info(f"[{city}] process_combo_with_retry returned: success={success}, rows={len(rows) if rows else 0}")
 
@@ -213,16 +254,20 @@ async def process_city_combos_concurrent(
                 processed_combos_global.add(combo_key)
 
                 # Save checkpoint after EACH combo for maximum resume capability
+                # Run all checkpoint saves in parallel (async)
                 try:
-                    atomic_pickle_dump(processed_combos_global, "storage/processed_combos.pkl")
-                    atomic_pickle_dump(club_cache, "storage/club_cache.pkl")
-                    save_checkpoint_json(
-                        processed_combos=processed_combos_global,
-                        club_cache=club_cache,
-                        stats=stats,
-                        current_city=city,
-                        current_combo=(age, play_with),
-                        pending_cities=None
+                    await asyncio.gather(
+                        async_atomic_pickle_dump(processed_combos_global, "storage/processed_combos.pkl"),
+                        async_atomic_pickle_dump(club_cache, "storage/club_cache.pkl"),
+                        async_save_checkpoint_json(
+                            processed_combos=processed_combos_global,
+                            club_cache=club_cache,
+                            stats=stats,
+                            current_city=city,
+                            current_combo=(age, play_with),
+                            pending_cities=None
+                        ),
+                        return_exceptions=True
                     )
                 except Exception as e:
                     log_error_with_context(
@@ -266,6 +311,7 @@ def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
     clubs_saved_lock = args.get("clubs_saved_lock")
     limit = args.get("limit", 0)
     max_booking_urls = args.get("max_booking_urls", 0)
+    phase2_only = args.get("phase2_only", False)
 
     start = time.time()
     logger.info(f"Process start for city {city}, combos={len(pending_combos)}, dry_run={dry_run}, limit={limit}, max_booking_urls={max_booking_urls}, combo_concurrency={MAX_COMBO_CONCURRENCY}")
@@ -296,22 +342,27 @@ def process_city_worker(args: WorkerArgs) -> Dict[str, Any]:
             clubs_saved_lock=clubs_saved_lock,
             shared_counter=shared_counter,
             shared_lock=shared_lock,
-            pbar=pbar
+            pbar=pbar,
+            phase2_only=phase2_only
         ))
 
     finally:
         # Checkpoint already saved after each combo, but save final state
+        # Run all checkpoint saves in parallel (async)
         try:
-            atomic_pickle_dump(processed_combos_global, "storage/processed_combos.pkl")
-            atomic_pickle_dump(club_cache, "storage/club_cache.pkl")
-            save_checkpoint_json(
-                processed_combos=processed_combos_global,
-                club_cache=club_cache,
-                stats=stats,
-                current_city=city,
-                current_combo=(pending_combos[-1][0], pending_combos[-1][1]) if pending_combos else (0, 4),
-                pending_cities=None
-            )
+            loop.run_until_complete(asyncio.gather(
+                async_atomic_pickle_dump(processed_combos_global, "storage/processed_combos.pkl"),
+                async_atomic_pickle_dump(club_cache, "storage/club_cache.pkl"),
+                async_save_checkpoint_json(
+                    processed_combos=processed_combos_global,
+                    club_cache=club_cache,
+                    stats=stats,
+                    current_city=city,
+                    current_combo=(pending_combos[-1][0], pending_combos[-1][1]) if pending_combos else (0, 4),
+                    pending_cities=None
+                ),
+                return_exceptions=True
+            ))
         except Exception as e:
             log_error_with_context(
                 logger, f"Final dump failed: {e}",

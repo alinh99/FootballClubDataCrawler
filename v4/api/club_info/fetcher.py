@@ -4,7 +4,7 @@ Club Info API fetching for v4 crawler.
 import asyncio
 import random
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 
 from curl_cffi import AsyncSession
 
@@ -15,7 +15,9 @@ from v4.config import (
 )
 from v4.models import AdaptiveLimiter
 from v4.types import ClubId, CityName, ClubRow, StatsDict, ClubCache
+from v4.eta import ETACalculator
 from v4.utils.logging import log_error_with_context
+from v4.eta import PhaseETACalculator
 
 from .payload import build_club_info_payload, build_club_info_headers
 from .contact_fetcher import fetch_contact_info
@@ -23,6 +25,40 @@ from .booking_scraper import scrape_booking_url_for_contact
 from .builder import build_club_row
 
 logger = logging.getLogger(__name__)
+
+
+# Helper functions to safely extract values from dicts (handle NaN/float from pandas/CSV)
+import math
+
+def _safe_get_str(data_dict, key, default=""):
+    val = data_dict.get(key, default)
+    if val is None:
+        return default
+    if isinstance(val, float) and math.isnan(val):
+        return default
+    return str(val).strip()
+
+def _safe_get_float(data_dict, key, default=0.0):
+    val = data_dict.get(key, default)
+    if val is None:
+        return default
+    if isinstance(val, float) and math.isnan(val):
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+def _safe_get_int(data_dict, key, default=0):
+    val = data_dict.get(key, default)
+    if val is None:
+        return default
+    if isinstance(val, float) and math.isnan(val):
+        return default
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
 
 
 async def fetch_club_info(
@@ -44,7 +80,10 @@ async def fetch_club_info(
     football_type: str = "U10",
     search_id: Optional[str] = None,
     recommendation_data_list: Optional[List[Dict[str, Any]]] = None,
-    max_booking_urls: int = 0
+    max_booking_urls: int = 0,
+    booking_eta: Optional["ETACalculator"] = None,
+    crawled_club_names: Optional[Set[str]] = None,
+    crawled_booking_urls: Optional[Set[str]] = None
 ) -> Optional[ClubRow]:
     """
     Fetch detailed club information from the club info API.
@@ -66,19 +105,101 @@ async def fetch_club_info(
         search_id = str(uuid.uuid4())
 
     # ===== CLUB CACHE: Return cached data if available =====
-    if club_id in club_cache:
+    if club_id not in (0, "0") and club_id in club_cache:
         cached_row = club_cache[club_id]
-        # Verify cached row matches requested club_id (duplicate checking only)
-        if (isinstance(cached_row, dict)
-            and cached_row.get("ClubId") == club_id):
+        # Verify cached row is valid (duplicate checking only)
+        # Note: ClubId field was removed during checkpoint loading, so we trust the dict key
+        if isinstance(cached_row, dict):
             stats["skipped_cache"] += 1
             logger.info(f"[CACHE HIT] Club {club_id} found in cache, skipping API call")
             return cached_row
         else:
-            # Invalid cache entry or ClubId mismatch, remove it
-            cached_club_id = cached_row.get("ClubId") if isinstance(cached_row, dict) else None
-            logger.warning(f"[CACHE INVALID] Club {club_id}: cached={cached_club_id}, removing")
+            # Invalid cache entry, remove it
+            logger.warning(f"[CACHE INVALID] Club {club_id}: cached entry is not a dict, removing")
             del club_cache[club_id]
+    else:
+        logger.info(f"[CACHE MISS] Club {club_id} not found in cache, proceeding with API call")
+
+
+    # ===== CLUB ID = 0: Skip API call, use booking scraper directly =====
+    # ClubId 0 (or "0") indicates no valid club ID - use recommendation data + booking scraper
+    if club_id in (0, "0"):
+        logger.info(f"[{city}] Club {club_id}: ClubId is 0, skipping API call, using booking scraper with recommendation data")
+        if recommendation_data_list:
+            try:
+                # Use first entry for basic info
+                fallback_data = recommendation_data_list[0]
+
+                # Get club name from recommendation data (ClubName or OrganizationName)
+                club_name = _safe_get_str(fallback_data, "ClubName") or _safe_get_str(fallback_data, "OrganizationName")
+
+                if not club_name:
+                    logger.warning(f"[{city}] Club {club_id}: No club name in recommendation data, skipping")
+                    return None
+
+                # Collect ALL booking URLs from ALL recommendation data entries
+                booking_urls = []
+                for rec_data in recommendation_data_list:
+                    booking_url = _safe_get_str(rec_data, "BookingURL") or _safe_get_str(rec_data, "BookingUrl") or ""
+                    if booking_url and booking_url.strip():
+                        booking_urls.append(booking_url.strip())
+
+                # Limit booking URLs if max_booking_urls is set
+                if max_booking_urls > 0:
+                    booking_urls = booking_urls[:max_booking_urls]
+
+                # Scrape booking URLs for contact info
+                booking_contact = {}
+                if booking_urls:
+                    logger.info(f"[{city}] → ClubId=0: Scraping {len(booking_urls)} BookingURL(s)")
+                    for bu in booking_urls:
+                        logger.info(f"[{city}] → BookingURL: {bu}")
+                    try:
+                        from .booking_scraper import scrape_multiple_booking_urls
+                        booking_contact = await scrape_multiple_booking_urls(
+                            booking_urls, client, booking_eta,
+                            crawled_club_names=crawled_club_names,
+                            crawled_booking_urls=crawled_booking_urls,
+                            club_name=club_name
+                        )
+                    except Exception as e:
+                        logger.warning(f"[BOOKING SCRAPE] Error for club {club_id} (URLs: {booking_urls}): {e}")
+
+                # Build row with recommendation data + scraped contact info
+                # ClubURL: for valid club IDs use https://find.englandfootball.com/club/{club_id}
+                # For ClubId=0, use the first booking URL as fallback
+                first_booking_url = booking_urls[0] if booking_urls else ""
+                club_url = f"https://find.englandfootball.com/club/{club_id}" if club_id not in (0, "0") else first_booking_url
+                row = build_club_row(
+                    city=city,
+                    play_with=play_with,
+                    age=age,
+                    club_name=club_name,
+                    data=fallback_data,  # Use recommendation data as base
+                    contact_data={},     # No WGS contact data available
+                    booking_contact=booking_contact,
+                    week_days=_safe_get_str(fallback_data, "WeekDays", "1,2,3,4,5,6,7"),
+                    latitude=_safe_get_float(fallback_data, "Latitude", 51.5074),
+                    longitude=_safe_get_float(fallback_data, "Longitude", -0.1278),
+                    school_year=_safe_get_str(fallback_data, "SchoolYear", ""),
+                    football_type=_safe_get_str(fallback_data, "FootballType", "U10"),
+                    disability_option=_safe_get_int(fallback_data, "Disabilityoption", 3),
+                    search_id=_safe_get_str(fallback_data, "SearchId", None),
+                    club_id=str(club_id),  # Use the original club_id (0 or "0")
+                    booking_url=first_booking_url,
+                )
+
+                # Cache and return (don't cache club_id=0 to avoid collisions, but return the row)
+                logger.info(f"[SUCCESS] Club {club_id} processed via booking scraper (no API call)")
+                stats["success"] += 1
+                return row
+
+            except Exception as e:
+                logger.warning(f"[{city}] Club {club_id}: Booking scraper failed: {e}")
+                return None
+        else:
+            logger.warning(f"[{city}] Club {club_id}: ClubId is 0 but no recommendation_data_list provided, skipping")
+            return None
 
     payload = build_club_info_payload(
         club_id=club_id,
@@ -119,6 +240,9 @@ async def fetch_club_info(
                         "User-Agent": f"sb/{random.randint(1, 1000)}",
                         "Ocp-Apim-Subscription-Key": KEY_CLUB_INFO_AND_RECOMMENDATION_INFO
                     }
+                    logger.info(f"[{city}] → ClubInfo API call for ClubId={club_id} (attempt {attempt+1})")
+                    logger.info(f"[{city}] → API URL: {API_CLUB_INFO_URL}")
+                    logger.debug(f"[{city}] → Payload: {payload}")
                     resp = await client.post(API_CLUB_INFO_URL, json=payload, headers=headers, timeout=300.0)
                     if resp.status_code in (400, 401, 403):
                         # 400 Bad Request (e.g., invalid ClubId), 401/403 auth failures - don't retry
@@ -157,18 +281,36 @@ async def fetch_club_info(
                         contact_data = await fetch_contact_info(client, wgs_id)
 
                     # --- Scrape BookingURL for additional contact info ---
-                    booking_url = data.get("BookingURL", "") or data.get("BookingUrl", "") or ""
+                    import math
+                    def safe_get_str(data_dict, key, default=""):
+                        val = data_dict.get(key, default)
+                        if val is None:
+                            return default
+                        if isinstance(val, float) and math.isnan(val):
+                            return default
+                        return str(val).strip()
+
+                    booking_url = safe_get_str(data, "BookingURL") or safe_get_str(data, "BookingUrl") or ""
                     booking_contact = {}
                     if booking_url:
+                        logger.info(f"[{city}] → Scraping BookingURL for ClubId={club_id}: {booking_url}")
                         try:
-                            booking_contact = await scrape_booking_url_for_contact(booking_url, client)
+                            booking_contact = await scrape_booking_url_for_contact(
+                                booking_url, client,
+                                crawled_booking_urls=crawled_booking_urls,
+                                crawled_club_names=crawled_club_names,
+                                club_name=club_name
+                            )
                         except Exception as e:
-                            logger.warning(f"[BOOKING SCRAPE] Error for club {club_id}: {e}")
+                            logger.warning(f"[BOOKING SCRAPE] Error for club {club_id} (URL: {booking_url}): {e}")
 
                 club_name = (data.get("ClubName", "") or data.get("OrganizationName", "") or "").strip()
                 if not club_name:
                     stats["no_name"] += 1
                     return None
+
+                # Build ClubURL: https://find.englandfootball.com/club/{club_id}
+                club_url = f"https://find.englandfootball.com/club/{club_id}" if club_id not in (0, "0") else booking_url
 
                 # Build row with all data
                 row = build_club_row(
@@ -187,6 +329,7 @@ async def fetch_club_info(
                     disability_option=disability_option,
                     search_id=search_id,
                     club_id=club_id,
+                    booking_url=booking_url,
                 )
 
                 # ===== CLUB CACHE: Store successful result =====
@@ -210,17 +353,7 @@ async def fetch_club_info(
                             fallback_data = recommendation_data_list[0]
 
                             # Get club name from recommendation data (ClubName or OrganizationName)
-                            # Handle NaN/float values from pandas
-                            import math
-                            def safe_get_str(data_dict, key, default=""):
-                                val = data_dict.get(key, default)
-                                if val is None:
-                                    return default
-                                if isinstance(val, float) and math.isnan(val):
-                                    return default
-                                return str(val).strip()
-
-                            club_name = safe_get_str(fallback_data, "ClubName") or safe_get_str(fallback_data, "OrganizationName")
+                            club_name = _safe_get_str(fallback_data, "ClubName") or _safe_get_str(fallback_data, "OrganizationName")
 
                             if not club_name:
                                 logger.warning(f"[{city}] Club {club_id}: No club name in fallback data, skipping")
@@ -229,7 +362,7 @@ async def fetch_club_info(
                             # Collect ALL booking URLs from ALL recommendation data entries
                             booking_urls = []
                             for rec_data in recommendation_data_list:
-                                booking_url = rec_data.get("BookingURL", "") or rec_data.get("BookingUrl", "") or ""
+                                booking_url = _safe_get_str(rec_data, "BookingURL") or _safe_get_str(rec_data, "BookingUrl") or ""
                                 if booking_url and booking_url.strip():
                                     booking_urls.append(booking_url.strip())
 
@@ -240,13 +373,23 @@ async def fetch_club_info(
                             # Scrape booking URLs for contact info
                             booking_contact = {}
                             if booking_urls:
+                                logger.info(f"[{city}] → Fallback: Scraping {len(booking_urls)} BookingURL(s) for ClubId={club_id}")
+                                for bu in booking_urls:
+                                    logger.info(f"[{city}] → BookingURL: {bu}")
                                 try:
                                     from .booking_scraper import scrape_multiple_booking_urls
-                                    booking_contact = await scrape_multiple_booking_urls(booking_urls, client)
+                                    booking_contact = await scrape_multiple_booking_urls(
+                                        booking_urls, client, booking_eta,
+                                        crawled_club_names=crawled_club_names,
+                                        crawled_booking_urls=crawled_booking_urls,
+                                        club_name=club_name
+                                    )
                                 except Exception as e:
-                                    logger.warning(f"[BOOKING SCRAPE] Error for club {club_id}: {e}")
+                                    logger.warning(f"[BOOKING SCRAPE] Error for club {club_id} (URLs: {booking_urls}): {e}")
 
                             # Build row with recommendation data + scraped contact info
+                            first_booking_url = booking_urls[0] if booking_urls else ""
+                            club_url = f"https://find.englandfootball.com/club/{club_id}" if club_id not in (0, "0") else first_booking_url
                             row = build_club_row(
                                 city=city,
                                 play_with=play_with,
@@ -255,14 +398,15 @@ async def fetch_club_info(
                                 data=fallback_data,  # Use recommendation data as base
                                 contact_data={},     # No WGS contact data available
                                 booking_contact=booking_contact,
-                                week_days=fallback_data.get("WeekDays", "1,2,3,4,5,6,7"),
-                                latitude=fallback_data.get("Latitude", 51.5074),
-                                longitude=fallback_data.get("Longitude", -0.1278),
-                                school_year=fallback_data.get("SchoolYear", ""),
-                                football_type=fallback_data.get("FootballType", "U10"),
-                                disability_option=fallback_data.get("Disabilityoption", 3),
-                                search_id=fallback_data.get("SearchId", None),
+                                week_days=_safe_get_str(fallback_data, "WeekDays", "1,2,3,4,5,6,7"),
+                                latitude=_safe_get_float(fallback_data, "Latitude", 51.5074),
+                                longitude=_safe_get_float(fallback_data, "Longitude", -0.1278),
+                                school_year=_safe_get_str(fallback_data, "SchoolYear", ""),
+                                football_type=_safe_get_str(fallback_data, "FootballType", "U10"),
+                                disability_option=_safe_get_int(fallback_data, "Disabilityoption", 3),
+                                search_id=_safe_get_str(fallback_data, "SearchId", None),
                                 club_id=str(club_id),  # Use the original club_id (could be 0)
+                                booking_url=first_booking_url,
                             )
 
                             # Cache and return

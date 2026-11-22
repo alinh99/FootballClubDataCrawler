@@ -21,6 +21,7 @@ def build_club_row(
     disability_option: int,
     search_id: str,
     club_id: str,
+    booking_url: str = "",
 ) -> ClubRow:
     """
     Build a ClubRow from all available data sources.
@@ -45,6 +46,14 @@ def build_club_row(
     # Booking URL scraped fields
     booking_venue = booking_contact.get("venue", "")
     booking_address = booking_contact.get("address", "")
+
+    # Construct the Club URL:
+    # - For ClubId=0: use booking_url
+    # - For valid ClubId: use https://find.englandfootball.com/club/{club_id}
+    if club_id not in (0, "0"):
+        club_url = f"https://find.englandfootball.com/club/{club_id}"
+    else:
+        club_url = booking_url
 
     row: ClubRow = {
         "City": city,
@@ -78,6 +87,7 @@ def build_club_row(
         # Booking URL scraped fields
         "BookingVenue": booking_venue,
         "BookingAddress": booking_address,
+        "ClubURL": club_url,
     }
 
     return row

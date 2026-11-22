@@ -3,6 +3,7 @@ Pickle utilities for v4 crawler: safe load and atomic dump.
 """
 import os
 import pickle
+import asyncio
 import logging
 from typing import Any
 
@@ -34,3 +35,9 @@ def atomic_pickle_dump(data: Any, path: str) -> None:
                 os.remove(tmp_path)
             except Exception:
                 pass
+
+
+async def async_atomic_pickle_dump(data: Any, path: str) -> None:
+    """Async version of atomic_pickle_dump - runs in thread pool to avoid blocking."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, atomic_pickle_dump, data, path)

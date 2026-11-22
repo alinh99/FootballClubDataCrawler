@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-combos", type=int, default=0, help="Max city combos to process (0 = all)")
     parser.add_argument("--max-booking-urls", type=int, default=0, help="Max booking URLs per club (0 = unlimited)")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint (default: auto)")
+    parser.add_argument("--phase2-only", action="store_true", help="Run Phase 2 only (detail fetch) using existing clubs_basic.csv, clubs_final.csv, checkpoints.json, club_cache.pkl")
     return parser.parse_args()
 
 
@@ -65,7 +66,7 @@ def main() -> int:
 
     # Run crawler
     try:
-        run_crawler(cities, args.dry_run, args.limit, args.max_combos, args.max_booking_urls)
+        run_crawler(cities, args.dry_run, args.limit, args.max_combos, args.max_booking_urls, args.phase2_only)
         logger.info("=" * 60)
         logger.info("✅ Crawl completed successfully")
         logger.info("=" * 60)

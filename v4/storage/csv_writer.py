@@ -11,8 +11,8 @@ import pandas as pd
 from filelock import FileLock
 
 from v4.config import (
-    CSV_FILE, CSV_BASIC_FILE,
-    CSV_LOCK_FILE, CSV_BASIC_LOCK_FILE,
+    CSV_BASIC_FILE, CSV_FILE, CSV_FINAL_FILE,
+    CSV_BASIC_LOCK_FILE, CSV_FINAL_LOCK_FILE,
     BATCH_SAVE_SIZE
 )
 from v4.types import ClubRow, BasicClubRow
@@ -129,13 +129,14 @@ class AsyncCSVWriter:
 
         def _sync_write():
             with self._lock:
+                import csv
                 df = pd.DataFrame(batch)
                 # Ensure consistent column order
                 main_cols = ["City", "PlayWith", "Age"]
                 other_cols = [c for c in df.columns if c not in main_cols]
                 df = df[main_cols + other_cols]
                 header = not self._header_written
-                df.to_csv(self.csv_path, mode="a", index=False, header=header)
+                df.to_csv(self.csv_path, mode="a", index=False, header=header, quoting=csv.QUOTE_MINIMAL)
                 self._header_written = True
 
         # Run blocking I/O in thread pool
@@ -153,7 +154,7 @@ async def get_csv_writer() -> AsyncCSVWriter:
     """Get or create the global CSV writer for detailed data."""
     global _csv_writer
     if _csv_writer is None:
-        _csv_writer = AsyncCSVWriter(CSV_FILE, CSV_LOCK_FILE)
+        _csv_writer = AsyncCSVWriter(CSV_FILE, CSV_FINAL_LOCK_FILE)
         await _csv_writer.start()
     return _csv_writer
 
@@ -180,15 +181,16 @@ async def async_append_basic_csv_rows(rows: List[BasicClubRow]) -> None:
 
     def _sync_write():
         import pandas as pd
+        import csv
         from filelock import FileLock
         df = pd.DataFrame(rows)
         # Ensure consistent column order
         main_cols = ["City", "PlayWith", "Age"]
         other_cols = [c for c in df.columns if c not in main_cols]
         df = df[main_cols + other_cols]
-        header = not os.path.exists(CSV_BASIC_FILE)
         with FileLock(CSV_BASIC_LOCK_FILE, timeout=30):
-            df.to_csv(CSV_BASIC_FILE, mode="a", index=False, header=header)
+            header = not os.path.exists(CSV_BASIC_FILE)
+            df.to_csv(CSV_BASIC_FILE, mode="a", index=False, header=header, quoting=csv.QUOTE_MINIMAL)
         logger.debug(f"Wrote {len(rows)} basic rows to {CSV_BASIC_FILE}")
 
     loop = asyncio.get_event_loop()

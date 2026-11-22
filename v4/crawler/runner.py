@@ -2,6 +2,7 @@
 Main crawler runner for v4: orchestrates multiprocessing + asyncio.
 """
 import time
+import asyncio
 import logging
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -11,10 +12,11 @@ from multiprocessing.synchronize import Lock as LockProxy
 from tqdm import tqdm
 from typing import Any, Dict, List
 
-from v4.config import MAX_PROCESSES, MAX_CONCURRENT_REQUESTS, CSV_FILE
+from v4.config import MAX_PROCESSES, MAX_CONCURRENT_REQUESTS, CSV_FILE, CSV_BASIC_FILE, CSV_FINAL_FILE, CSV_BASIC_LOCK_FILE, CSV_FINAL_LOCK_FILE
 from v4.storage import (
     load_existing_output_info, safe_load_pickle, save_summary_csv,
-    load_checkpoint_json, save_checkpoint_json, log_checkpoint_status
+    load_checkpoint_json, save_checkpoint_json, async_save_checkpoint_json,
+    async_atomic_pickle_dump, log_checkpoint_status
 )
 from v4.eta import ETACalculator
 from v4.types import CityName, StatsDict, WorkerArgs
@@ -30,14 +32,25 @@ def run_crawler(
     dry_run: bool = False,
     limit: int = 0,
     max_combos: int = 0,
-    max_booking_urls: int = 0
+    max_booking_urls: int = 0,
+    phase2_only: bool = False
 ) -> None:
     """
     Run the crawler for multiple cities using multiprocessing + asyncio.
     Uses JSON checkpoint for human-readable resume capability.
     """
     # Load existing data from CSV + JSON checkpoint (priority: JSON > pickle > CSV)
-    _, combos_from_csv = load_existing_output_info()
+    if phase2_only:
+        # Phase 2 only: use clubs_basic.csv to determine what has Phase 1 data
+        # and clubs_data.csv (CSV_FILE) to determine what already has Phase 2 data
+        from v4.storage import get_processed_combos_from_csv
+        combos_from_basic = get_processed_combos_from_csv(CSV_BASIC_FILE)
+        combos_from_final = get_processed_combos_from_csv(CSV_FILE)
+        # Pending = has basic data but NOT final data yet
+        combos_from_csv = combos_from_basic - combos_from_final
+        logger.info(f"Phase 2 only: {len(combos_from_basic)} combos in basic CSV, {len(combos_from_final)} in final CSV, {len(combos_from_csv)} pending")
+    else:
+        _, combos_from_csv = load_existing_output_info()
     processed_from_pickle = safe_load_pickle("storage/processed_combos.pkl", set()) or set()
     existing_combo_set = set().union(combos_from_csv, processed_from_pickle)
 
@@ -45,8 +58,8 @@ def run_crawler(
     (json_processed_combos, json_club_cache, json_stats,
      json_current_city, json_current_combo, json_pending_cities) = load_checkpoint_json()
 
-    # Merge JSON checkpoint with existing data
-    if json_processed_combos:
+    # Merge JSON checkpoint with existing data (skip processed_combos in phase2_only)
+    if not phase2_only and json_processed_combos:
         existing_combo_set.update(json_processed_combos)
         logger.info(f"Loaded {len(json_processed_combos)} combos from JSON checkpoint")
 
@@ -64,7 +77,8 @@ def run_crawler(
     combos_added = 0
 
     # Use pending cities from JSON checkpoint if available, otherwise all cities
-    cities_to_process = json_pending_cities if json_pending_cities else cities
+    # In phase2_only mode, use all cities (will filter by pending combos from basic CSV)
+    cities_to_process = json_pending_cities if (json_pending_cities and not phase2_only) else cities
 
     for city in cities_to_process:
         pending = build_pending_combos_for_city(city, existing_combo_set)
@@ -79,7 +93,7 @@ def run_crawler(
             else:
                 combos_added += len(pending)
 
-            city_args.append({"city": city, "pending_combos": pending, "dry_run": dry_run, "max_booking_urls": max_booking_urls})
+            city_args.append({"city": city, "pending_combos": pending, "dry_run": dry_run, "max_booking_urls": max_booking_urls, "phase2_only": phase2_only})
             total_pending_combos += len(pending)
         else:
             logger.info(f"City {city} already fully completed, skipping.")
@@ -215,15 +229,16 @@ def run_crawler(
     logger.info("Starting final deduplication pass...")
     try:
         import pandas as pd
-        df = pd.read_csv(CSV_FILE)
+        import csv
+        df = pd.read_csv(CSV_FILE, quoting=csv.QUOTE_MINIMAL, engine='python', on_bad_lines='skip')
         original_count = len(df)
-        ignore_cols = {"PlayWith", "Age", "Latitude", "Longitude", "SearchId"}
+        ignore_cols = {"PlayWith", "Age", "Latitude", "Longitude", "SearchId", "ClubId"}
         subset_cols = [c for c in df.columns if c not in ignore_cols]
         df_deduped = df.drop_duplicates(subset=subset_cols)
         deduped_count = len(df_deduped)
         removed_count = original_count - deduped_count
         if removed_count > 0:
-            df_deduped.to_csv(CSV_FILE, index=False)
+            df_deduped.to_csv(CSV_FINAL_FILE, index=False, quoting=csv.QUOTE_MINIMAL)
             logger.info(f"Final deduplication: removed {removed_count} duplicate rows (ignoring {ignore_cols}, keeping City) ({original_count} → {deduped_count})")
         else:
             logger.info(f"Final deduplication: no duplicates found ({original_count} rows)")
@@ -244,14 +259,22 @@ def run_crawler(
         all_done_combos = set().union(combos_from_csv, final_processed)
         pending_cities = [c for c in cities if build_pending_combos_for_city(c, all_done_combos)]
 
-        save_checkpoint_json(
-            processed_combos=final_processed,
-            club_cache=final_cache,
-            stats=overall_stats,
-            current_city=None,
-            current_combo=None,
-            pending_cities=pending_cities
-        )
+        # Save all checkpoints in parallel (async)
+        async def save_checkpoints():
+            await asyncio.gather(
+                async_atomic_pickle_dump(final_processed, "storage/processed_combos.pkl"),
+                async_atomic_pickle_dump(final_cache, "storage/club_cache.pkl"),
+                async_save_checkpoint_json(
+                    processed_combos=final_processed,
+                    club_cache=final_cache,
+                    stats=overall_stats,
+                    current_city=None,
+                    current_combo=None,
+                    pending_cities=pending_cities
+                ),
+                return_exceptions=True
+            )
+        asyncio.run(save_checkpoints())
         logger.info(f"JSON checkpoint saved: {len(pending_cities)} cities pending for next run")
     except Exception as e:
         logger.warning(f"Failed to save JSON checkpoint: {e}")

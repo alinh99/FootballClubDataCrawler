@@ -5,15 +5,19 @@ import os
 import re
 import logging
 import asyncio
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
 # Set custom driver path to avoid permission issues with system Python site-packages
 DRIVER_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "drivers")
 os.environ.setdefault("SELENIUMBASE_DRIVER_PATH", DRIVER_PATH)
 
 from bs4 import BeautifulSoup
+from v4.eta import PhaseETACalculator, ETACalculator
 
 logger = logging.getLogger(__name__)
+
+# Global semaphore to ensure booking URLs are scraped sequentially (one at a time)
+_booking_scraper_semaphore = asyncio.Semaphore(1)
 
 
 def _scrape_booking_url_sync(booking_url: str) -> Dict[str, str]:
@@ -22,32 +26,50 @@ def _scrape_booking_url_sync(booking_url: str) -> Dict[str, str]:
     Runs in a thread pool to avoid blocking the event loop.
     """
     from seleniumbase import Driver
+    import time
 
     contact_info = {}
     driver = None
+    max_driver_retries = 3
+
+    for driver_attempt in range(max_driver_retries):
+        try:
+            # Create undetected Chrome driver with stealth options
+            driver = Driver(
+                uc=True,           # Undetected ChromeDriver mode
+                headless=True,     # Run headless
+                incognito=True,    # Clean session each time
+                disable_csp=True,  # Disable Content Security Policy
+                page_load_strategy="eager",  # Don't wait for all resources
+                browser="chrome",
+            )
+
+            # Set timeouts
+            driver.set_page_load_timeout(30)
+            driver.implicitly_wait(10)
+
+            logger.info(f"[BOOKING SCRAPE] Navigating to {booking_url}")
+            driver.get(booking_url)
+            break  # Success, exit retry loop
+
+        except Exception as e:
+            logger.warning(f"[BOOKING SCRAPE] Driver creation/navigation failed (attempt {driver_attempt + 1}/{max_driver_retries}): {e}")
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+            if driver_attempt == max_driver_retries - 1:
+                raise
+            time.sleep(2 * (driver_attempt + 1))  # Exponential backoff: 2s, 4s
+            continue
 
     try:
-        # Create undetected Chrome driver with stealth options
-        driver = Driver(
-            uc=True,           # Undetected ChromeDriver mode
-            headless=True,     # Run headless
-            incognito=True,    # Clean session each time
-            disable_csp=True,  # Disable Content Security Policy
-            page_load_strategy="eager",  # Don't wait for all resources
-            browser="chrome",
-        )
-
-        # Set timeouts
-        driver.set_page_load_timeout(30)
-        driver.implicitly_wait(10)
-
-        logger.info(f"[BOOKING SCRAPE] Navigating to {booking_url}")
-        driver.get(booking_url)
 
         # Wait for page to load and potential Cloudflare challenge to resolve
         # SeleniumBase's uc mode handles Cloudflare automatically
-        import time
-        time.sleep(10)  # Initial wait for page to start loading
+        time.sleep(5)  # Initial wait for page to start loading
 
         # Send Tab + Enter to interact with potential Cloudflare challenge (checkbox/button)
         try:
@@ -66,7 +88,7 @@ def _scrape_booking_url_sync(booking_url: str) -> Dict[str, str]:
         if _is_cloudflare_challenge(driver.page_source):
             logger.warning(f"[BOOKING SCRAPE] Cloudflare challenge detected for {booking_url}. Retrying after delay.")
             driver.refresh()
-            time.sleep(10)  # Wait for page to load
+            time.sleep(5)  # Wait for page to load
             try:
                 from selenium.webdriver.common.action_chains import ActionChains
                 from selenium.webdriver.common.keys import Keys
@@ -102,6 +124,8 @@ def _scrape_booking_url_sync(booking_url: str) -> Dict[str, str]:
 
         # Filter out navigation/menu lines
         content_lines = [line for line in lines if not is_skip_line(line)]
+
+        contact_info['booking_url'] = booking_url
 
         # Extract venue - look for known venue indicators
         # Venue often appears as: "Hayesfield Girls School" or similar school/venue names
@@ -220,6 +244,9 @@ def _scrape_booking_url_sync(booking_url: str) -> Dict[str, str]:
         for script in json_ld_scripts:
             try:
                 import json
+                # Skip empty script tags (script.string can be None)
+                if not script.string:
+                    continue
                 data = json.loads(script.string)
                 if isinstance(data, dict):
                     if data.get('@type') in ['Organization', 'LocalBusiness', 'SportsClub']:
@@ -229,8 +256,15 @@ def _scrape_booking_url_sync(booking_url: str) -> Dict[str, str]:
                         if 'address' in data and 'address' not in contact_info:
                             addr = data['address']
                             if isinstance(addr, dict):
-                                parts = [addr.get('streetAddress', ''), addr.get('addressLocality', ''), addr.get('postalCode', '')]
-                                contact_info['address'] = ', '.join(filter(None, parts))
+                                # Convert all parts to strings to handle numeric values (e.g., postalCode as number)
+                                parts = [
+                                    str(addr.get('streetAddress', '')),
+                                    str(addr.get('addressLocality', '')),
+                                    str(addr.get('postalCode', ''))
+                                ]
+                                # Filter out empty strings and "None" strings
+                                filtered_parts = [p for p in parts if p and p.lower() != 'none']
+                                contact_info['address'] = ', '.join(filtered_parts)
             except Exception:
                 pass
 
@@ -255,6 +289,7 @@ def _scrape_booking_url_sync(booking_url: str) -> Dict[str, str]:
 # Cloudflare challenge detection (English + Vietnamese)
 CLOUDFLARE_INDICATORS = [
     "chờ một chút",       # Vietnamese: "wait a moment"
+    "Đã phát hiện thấy thay đổi mạng.",  # Vietnamese: "Network change detected."
 ]
 
 
@@ -264,7 +299,10 @@ def _is_cloudflare_challenge(html: str) -> bool:
     return any(indicator in html_lower for indicator in CLOUDFLARE_INDICATORS)
 
 
-async def scrape_booking_url_for_contact(booking_url: str, _client=None) -> Dict[str, str]:
+async def scrape_booking_url_for_contact(booking_url: str, _client=None,
+                                          crawled_booking_urls: Optional[Set[str]] = None,
+                                          crawled_club_names: Optional[Set[str]] = None,
+                                          club_name: Optional[str] = None) -> Dict[str, str]:
     """
     Scrape the BookingURL static page for contact information using SeleniumBase.
 
@@ -286,16 +324,41 @@ async def scrape_booking_url_for_contact(booking_url: str, _client=None) -> Dict
     Args:
         booking_url: The booking URL to scrape
         client: Ignored (kept for API compatibility with old signature)
+        crawled_booking_urls: Set of already crawled booking URLs to skip
+        crawled_club_names: Set of already crawled club names to skip
+        club_name: Current club name being processed (for logging)
     """
-    if not booking_url or not booking_url.strip():
+    # Handle NaN/float values
+    import math
+    if booking_url is None:
+        return {}
+    if isinstance(booking_url, float) and math.isnan(booking_url):
+        return {}
+    booking_url = str(booking_url).strip()
+    if not booking_url:
+        return {}
+
+    # Skip if club name or booking URL already crawled (phase 2 only mode)
+    if crawled_club_names and club_name and club_name in crawled_club_names:
+        logger.info(f"[BOOKING SCRAPE] Skipping already crawled club: {club_name} (URL: {booking_url})")
+        return {}
+    if crawled_booking_urls and booking_url in crawled_booking_urls:
+        logger.info(f"[BOOKING SCRAPE] Skipping already crawled booking URL: {booking_url}")
         return {}
 
     # Run selenium in thread pool to avoid blocking event loop
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _scrape_booking_url_sync, booking_url)
+    try:
+        return await loop.run_in_executor(None, _scrape_booking_url_sync, booking_url)
+    except Exception as e:
+        logger.warning(f"[BOOKING SCRAPE] Error scraping {booking_url}: {e}")
+        return {}
 
 
-async def scrape_multiple_booking_urls(booking_urls: List[str], _client=None) -> Dict[str, str]:
+async def scrape_multiple_booking_urls(booking_urls: List[str], _client=None, booking_eta: Optional[ETACalculator] = None,
+                                       crawled_club_names: Optional[Set[str]] = None,
+                                       crawled_booking_urls: Optional[Set[str]] = None,
+                                       club_name: Optional[str] = None) -> Dict[str, str]:
     """
     Scrape multiple booking URLs and merge the results.
     Takes the first non-empty value for each field.
@@ -303,23 +366,99 @@ async def scrape_multiple_booking_urls(booking_urls: List[str], _client=None) ->
     Args:
         booking_urls: List of booking URLs to scrape
         client: Ignored (kept for API compatibility)
+        booking_eta: Optional shared ETACalculator for tracking progress across all clubs
+        crawled_club_names: Set of already crawled club names to skip
+        crawled_booking_urls: Set of already crawled booking URLs to skip
+        club_name: Current club name being processed (for logging)
 
     Returns:
         Merged contact info dict with: phone, email, website, address, contact_name, venue
     """
-    merged_contact = {}
+    if not booking_urls:
+        return {}
 
-    for booking_url in booking_urls:
-        if not booking_url or not booking_url.strip():
+    merged_contact = {}
+    total_urls = len(booking_urls)
+
+    # Use shared ETA calculator if provided, otherwise create local one
+    use_shared_eta = booking_eta is not None
+    local_eta = None
+    if not use_shared_eta:
+        local_eta = PhaseETACalculator(total_combos=1)
+        local_eta.start_phase2(total_urls)
+        booking_eta = local_eta.phase2_eta
+
+    for idx, booking_url in enumerate(booking_urls, 1):
+        # Ensure booking_url is a string and handle NaN/float values
+        import math
+        if booking_url is None:
+            logging.warning(f"[BOOKING SCRAPE] Skipping None booking URL at index {idx}/{total_urls} (URL: {booking_url})")
             continue
+        if isinstance(booking_url, float) and math.isnan(booking_url):
+            logging.warning(f"[BOOKING SCRAPE] Skipping NaN booking URL at index {idx}/{total_urls} (URL: {booking_url})")
+            continue
+        booking_url = str(booking_url).strip()
+        if not booking_url:
+            continue
+
+        # Skip if club name or booking URL already crawled (phase 2 only mode)
+        if crawled_club_names and club_name and club_name in crawled_club_names:
+            logger.info(f"[BOOKING SCRAPE] Skipping already crawled club: {club_name} (URL: {booking_url})")
+            if use_shared_eta:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
+            else:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
+            continue
+        if crawled_booking_urls and booking_url in crawled_booking_urls:
+            logger.info(f"[BOOKING SCRAPE] Skipping already crawled booking URL: {booking_url}")
+            if use_shared_eta:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
+            else:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
+            continue
+
         try:
-            contact = await scrape_booking_url_for_contact(booking_url, _client)
+            logger.info(f"[BOOKING SCRAPE] Processing URL {idx}/{total_urls}: {booking_url}")
+            # Use semaphore to ensure sequential execution globally
+            async with _booking_scraper_semaphore:
+                contact = await scrape_booking_url_for_contact(booking_url, _client)
             # Merge: take first non-empty value for each field
             for key, value in contact.items():
                 if value and key not in merged_contact:
                     merged_contact[key] = value
+
+            # Update booking ETA
+            if use_shared_eta:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
+            else:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
+
+            # Small delay between requests to avoid overwhelming the server
+            if idx < total_urls:
+                await asyncio.sleep(2)
+
         except Exception as e:
-            logger.warning(f"[BOOKING SCRAPE] Error scraping {booking_url}: {e}")
+            logger.warning(f"[BOOKING SCRAPE] Error scraping URL {idx}/{total_urls} ({booking_url}): {e}")
+            # Still update ETA for failed URL
+            if use_shared_eta:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
+            else:
+                booking_eta.update(idx)
+                booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=False)
             continue
+
+    if use_shared_eta:
+        booking_eta.update(total_urls)
+        booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=True)
+    else:
+        booking_eta.update(total_urls)
+        booking_eta.log_progress(logger, f"[BOOKING SCRAPE] ", force=True)
 
     return merged_contact

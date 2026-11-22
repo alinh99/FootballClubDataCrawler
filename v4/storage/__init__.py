@@ -4,11 +4,12 @@ Re-exports all storage utilities.
 """
 
 # Pickle utilities
-from v4.storage.pickle_utils import safe_load_pickle, atomic_pickle_dump
+from v4.storage.pickle_utils import safe_load_pickle, atomic_pickle_dump, async_atomic_pickle_dump
 
 # JSON Checkpoint (new - human readable)
 from v4.storage.json_checkpoint import (
     save_checkpoint_json,
+    async_save_checkpoint_json,
     load_checkpoint_json,
     log_checkpoint_status,
     log_error_to_file,
@@ -48,8 +49,10 @@ __all__ = [
     # Pickle
     "safe_load_pickle",
     "atomic_pickle_dump",
+    "async_atomic_pickle_dump",
     # JSON Checkpoint
     "save_checkpoint_json",
+    "async_save_checkpoint_json",
     "load_checkpoint_json",
     "log_checkpoint_status",
     "log_error_to_file",
