@@ -17,6 +17,7 @@ from v4.config import (
 )
 from v4.types import CityName, RecommendationResponse
 from v4.utils.logging import log_error_with_context
+from v4.eta import PhaseETACalculator
 
 from .payload import build_recommendation_payload, build_page_payload
 from .extractor import extract_clubids_from_recommendation, get_cnt_opportunity
@@ -43,6 +44,8 @@ def fetch_page_sync(client: curl_requests.Session, city: CityName, page_number: 
     for attempt in range(TOTAL_RETRIES):
         try:
             logger.info(f"[{city}] → Fetching page {page_number} (attempt {attempt+1})...")
+            logger.info(f"[{city}] → API URL: {API_CLUB_RECOMMENDATION_URL}")
+            logger.debug(f"[{city}] → Payload: {payload}")
             resp = client.post(API_CLUB_RECOMMENDATION_URL, json=payload, headers=headers)
             # Handle status codes
             if resp.status_code == 204:
@@ -146,9 +149,19 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False, limi
                     logger.info(f"[{city}] Total clubs: {cnt_opportunity}, PageSize: {page_size} → {total_pages} pages")
                     logger.info(f"[{city}] Progress: {clubs_fetched}/{cnt_opportunity} clubs fetched ({clubs_fetched/cnt_opportunity*100:.1f}%)")
 
+        # Phase 1 ETA calculator (clubs level)
+        phase1_eta = PhaseETACalculator(total_combos=1)
+        if cnt_opportunity > 0:
+            phase1_eta.start_phase1(cnt_opportunity)
+        else:
+            # Estimate if we don't have count yet
+            phase1_eta.start_phase1(page_size * (total_pages or 10))
+
         # Check limit after page 1
         if limit > 0 and clubs_fetched >= limit:
             logger.info(f"[{city}] Limit reached ({limit}) after page 1, stopping")
+            phase1_eta.update_phase1(clubs_fetched)
+            phase1_eta.log_phase1(logger, city, force=True)
             return all_results
 
         # Small delay after page 1 before fetching remaining pages
@@ -178,6 +191,8 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False, limi
                 if result is None:
                     # 204 No Content - no more pages
                     logger.info(f"[{city}] Page {current_page}: 204 No Content - no more pages")
+                    phase1_eta.update_phase1(clubs_fetched)
+                    phase1_eta.log_phase1(logger, city, force=True)
                     return all_results
                 if result:
                     all_results.append(result)
@@ -191,9 +206,15 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False, limi
                     else:
                         logger.info(f"[{city}] Fetched {clubs_fetched} clubs so far")
 
+                    # Update Phase 1 ETA
+                    phase1_eta.update_phase1(clubs_fetched)
+                    phase1_eta.log_phase1(logger, city, force=False)
+
                     # Fallback check if no CntOpportunity
                     if total_pages is None and len(clubs_in_page) < page_size:
                         logger.info(f"[{city}] Page {current_page}: Got {len(clubs_in_page)} clubs (< {page_size}) - last page (fallback)")
+                        phase1_eta.update_phase1(clubs_fetched)
+                        phase1_eta.log_phase1(logger, city, force=True)
                         return all_results
 
             if batch_completed == 0:
@@ -205,6 +226,8 @@ async def fetch_recommendation_pages(city: CityName, dry_run: bool = False, limi
             # Small delay between page requests to avoid rate limiting
             await asyncio.sleep(RECOMMENDATION_DELAY_BETWEEN_PAGES)
 
+        phase1_eta.update_phase1(clubs_fetched)
+        phase1_eta.log_phase1(logger, city, force=True)
         logger.info(f"[{city}] Completed fetching {len(all_results)} pages, {clubs_fetched} clubs total")
         return all_results
     finally:

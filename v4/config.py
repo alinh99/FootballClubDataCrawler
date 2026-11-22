@@ -21,11 +21,13 @@ INPUT_FILE: Final[str] = f"{OUTPUT_FOLDER_NAME}/england_city.csv"
 CITY_COLUMN: Final[str] = "name"
 CSV_FILE: Final[str] = f"{OUTPUT_FOLDER_NAME}/clubs_data.csv"
 CSV_BASIC_FILE: Final[str] = f"{OUTPUT_FOLDER_NAME}/clubs_basic.csv"
+CSV_FINAL_FILE: Final[str] = f"{OUTPUT_FOLDER_NAME}/clubs_final.csv"
 CACHE_FILE: Final[str] = f"{STORAGE_FOLDER_NAME}/club_cache.pkl"
 PROCESSED_FILE: Final[str] = f"{STORAGE_FOLDER_NAME}/processed_combos.pkl"
 LOG_FILE: Final[str] = f"{LOGS_FOLDER_NAME}/new_scraper_optimized.log"
 CSV_LOCK_FILE: Final[str] = os.path.join(STORAGE_FOLDER_NAME, "clubs_data.lock")
 CSV_BASIC_LOCK_FILE: Final[str] = os.path.join(STORAGE_FOLDER_NAME, "clubs_basic.lock")
+CSV_FINAL_LOCK_FILE: Final[str] = os.path.join(STORAGE_FOLDER_NAME, "clubs_final.lock")
 
 # ---------------- Config from .env ----------------
 MAX_PROCESSES: Final[int] = int(os.getenv("MAX_PROCESSES", 5))

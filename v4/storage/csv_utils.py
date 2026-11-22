@@ -18,7 +18,8 @@ def load_existing_csv(csv_path: str = CSV_FILE) -> ExistingClubNames:
     if not os.path.exists(csv_path):
         return {}
     try:
-        df = pd.read_csv(csv_path)
+        # Use quoting=csv.QUOTE_MINIMAL and engine='python' to handle fields with commas/quotes
+        df = pd.read_csv(csv_path, quoting=1, engine='python', on_bad_lines='skip')
         existing: ExistingClubNames = {}
         for _, row in df.iterrows():
             city = row.get("City", "")
@@ -39,7 +40,8 @@ def load_existing_output_info(csv_path: str = CSV_FILE) -> Tuple[ExistingClubNam
     if not os.path.exists(csv_path):
         return existing_club_names, combos_from_csv
     try:
-        df = pd.read_csv(csv_path)
+        # Use quoting=csv.QUOTE_MINIMAL and engine='python' to handle fields with commas/quotes
+        df = pd.read_csv(csv_path, quoting=1, engine='python', on_bad_lines='skip')
         for _, row in df.iterrows():
             city = row.get("City", "")
             name = row.get("Club Name", "")
@@ -71,7 +73,8 @@ def get_processed_combos_from_csv(csv_path: str = CSV_FILE) -> ProcessedCombos:
     if not os.path.exists(csv_path):
         return set()
     try:
-        df = pd.read_csv(csv_path)
+        # Use quoting=csv.QUOTE_MINIMAL and engine='python' to handle fields with commas/quotes
+        df = pd.read_csv(csv_path, quoting=1, engine='python', on_bad_lines='skip')
         combos: ProcessedCombos = set()
         for _, row in df.iterrows():
             city = row.get("City", "")

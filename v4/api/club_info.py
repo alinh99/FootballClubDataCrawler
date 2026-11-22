@@ -224,16 +224,6 @@ async def fetch_club_info(
                 }
 
                 # ===== CLUB CACHE: Store successful result =====
-                # Only cache if we have a valid club_id (not 0, None, empty)
-                # and the response contains a valid ClubId to avoid collisions
-                response_club_id = data.get("ClubId", club_id)
-                if club_id and response_club_id not in (0, None, "", "0"):
-                    club_cache[club_id] = row
-                    logger.info(f"[CACHE STORE] Club {club_id} cached successfully")
-                elif club_id in (0, None, "", "0"):
-                    logger.warning(f"[CACHE SKIP] Invalid club_id={club_id}, not caching to avoid collisions")
-                else:
-                    logger.warning(f"[CACHE SKIP] Response ClubId={response_club_id} invalid, not caching")
                 stats["success"] += 1
                 return row
 

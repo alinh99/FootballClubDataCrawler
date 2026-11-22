@@ -58,7 +58,6 @@ async def process_phase1(
         await async_append_basic_csv_rows(basic_rows)
         logger.info(f"[{city}] Phase 1: Written {len(basic_rows)} basic club rows (Age={age}, PlayWith={play_with})")
 
-    # Return unique club_ids (preserve order) - Phase 2 will handle multiple booking URLs per club
-    unique_club_ids = list(dict.fromkeys(club_ids_to_fetch_detail))
-    logger.info(f"[{city}] Phase 1: {len(club_ids_to_fetch_detail)} total entries, {len(unique_club_ids)} unique clubs for Phase 2")
-    return unique_club_ids
+    # Return all club_ids (preserve order) - Phase 2 will handle multiple booking URLs per club
+    logger.info(f"[{city}] Phase 1: {len(club_ids_to_fetch_detail)} total entries for Phase 2")
+    return club_ids_to_fetch_detail
